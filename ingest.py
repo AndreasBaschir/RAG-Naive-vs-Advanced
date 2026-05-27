@@ -11,6 +11,7 @@ Run once:
 from __future__ import annotations
 
 import pathlib
+from typing import Any, cast
 
 import chromadb
 from datasets import load_dataset
@@ -25,12 +26,13 @@ BATCH_SIZE = 256
 
 def ingest() -> None:
     print("Loading SQuAD dataset...")
-    dataset = load_dataset("squad", split="train")
+    dataset = load_dataset("rajpurkar/squad", split="train")
 
     # Deduplicate: același paragraf apare de mai multe ori (câte o întrebare per rând)
     seen: set[str] = set()
     contexts: list[dict] = []
-    for row in dataset:
+    for _row in dataset:
+        row = cast(dict[str, Any], _row)
         ctx = row["context"]
         if ctx not in seen:
             seen.add(ctx)
