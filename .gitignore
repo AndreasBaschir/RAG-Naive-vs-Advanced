@@ -2,3 +2,9 @@ venv
 venv/
 env
 __pycache__
+
+# Generated index — rebuild with `python -m naive.ingest`
+data/
+
+# Streamlit config (local overrides)
+.streamlit/
