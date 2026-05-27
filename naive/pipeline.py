@@ -9,7 +9,7 @@ from sentence_transformers import SentenceTransformer
 
 ROOT = pathlib.Path(__file__).parent.parent
 CHROMA_PATH = ROOT / "data" / "chroma"
-COLLECTION_NAME = "naive_rag"
+COLLECTION_NAME = "squad"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TOP_K = 5
