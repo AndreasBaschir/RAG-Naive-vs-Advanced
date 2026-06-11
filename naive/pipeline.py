@@ -5,6 +5,7 @@ from typing import Generator
 
 import chromadb
 import ollama
+import torch
 from sentence_transformers import SentenceTransformer
 
 ROOT = pathlib.Path(__file__).parent.parent
@@ -14,6 +15,7 @@ COLLECTION_NAME = "squad"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TOP_K = 5
 LLM_MODEL = "qwen3:8b"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 _embedder: SentenceTransformer | None = None
 _collection: chromadb.Collection | None = None
@@ -70,7 +72,7 @@ def stream(query: str, chunks: list[dict]) -> Generator[str, None, None]:
 def _get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer(EMBEDDING_MODEL)
+        _embedder = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE)
     return _embedder
 
 

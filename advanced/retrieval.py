@@ -9,6 +9,7 @@ from __future__ import annotations
 import pathlib
 
 import chromadb
+import torch
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
@@ -18,6 +19,7 @@ COLLECTION_NAME = "squad"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 _embedder: SentenceTransformer | None = None
 _collection: chromadb.Collection | None = None
@@ -119,7 +121,7 @@ def rerank(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
 def _get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer(EMBEDDING_MODEL)
+        _embedder = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE)
     return _embedder
 
 
@@ -139,7 +141,7 @@ def _get_collection() -> chromadb.Collection:
 def _get_reranker() -> CrossEncoder:
     global _reranker
     if _reranker is None:
-        _reranker = CrossEncoder(RERANKER_MODEL)
+        _reranker = CrossEncoder(RERANKER_MODEL, device=DEVICE)
     return _reranker
 
 
