@@ -12,19 +12,21 @@ Improvements over the naive baseline:
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Generator
 
 import ollama
 
-from advanced.retrieval import bm25_retrieve, dense_retrieve, rerank, rrf_merge
+from advanced.retrieval import bm25_retrieve, dense_retrieve_vec, encode, rerank, rrf_merge
 
 LLM_MODEL = "qwen3:8b"
+EXPANSION_MODEL = "qwen3:1.7b"  # small/fast model just for query rephrasing
 
-N_DENSE = 20     # dense candidates per query variant
-N_BM25 = 20     # BM25 candidates per query variant
+N_DENSE = 20    # dense candidates per query variant
+N_BM25 = 20    # BM25 candidates per query variant
 N_VARIANTS = 2  # extra query reformulations to generate
-RERANK_POOL = 40  # max candidates fed into the cross-encoder
-FINAL_K = 5     # chunks passed to the LLM
+RERANK_POOL = 20  # max candidates fed into the cross-encoder
+FINAL_K = 5    # chunks passed to the LLM
 
 _EXPAND_PROMPT = """\
 Generate {n} alternative phrasings for the following search query. \
@@ -56,10 +58,14 @@ def retrieve(query: str) -> list[dict]:
     """
     queries = _expand_queries(query)
 
-    ranked_lists: list[list[dict]] = []
-    for q in queries:
-        ranked_lists.append(dense_retrieve(q, n=N_DENSE))
-        ranked_lists.append(bm25_retrieve(q, n=N_BM25))
+    # Batch-encode all query variants in a single forward pass.
+    vecs = encode(queries)
+
+    # Fan out dense + BM25 retrievals in parallel across all query variants.
+    with ThreadPoolExecutor(max_workers=len(queries) * 2) as ex:
+        dense_futs = [ex.submit(dense_retrieve_vec, vec, N_DENSE) for vec in vecs]
+        bm25_futs = [ex.submit(bm25_retrieve, q, N_BM25) for q in queries]
+        ranked_lists = [f.result() for f in dense_futs + bm25_futs]
 
     merged = rrf_merge(ranked_lists)
     pool = merged[:RERANK_POOL]
@@ -89,7 +95,7 @@ def _expand_queries(query: str) -> list[str]:
     """Ask the LLM for N_VARIANTS alternative phrasings; fall back gracefully."""
     try:
         resp = ollama.chat(
-            model=LLM_MODEL,
+            model=EXPANSION_MODEL,
             messages=[{
                 "role": "user",
                 "content": _EXPAND_PROMPT.format(n=N_VARIANTS, query=query),
