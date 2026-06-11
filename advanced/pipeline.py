@@ -25,7 +25,7 @@ EXPANSION_MODEL = "qwen3:1.7b"  # small/fast model just for query rephrasing
 N_DENSE = 20    # dense candidates per query variant
 N_BM25 = 20    # BM25 candidates per query variant
 N_VARIANTS = 2  # extra query reformulations to generate
-RERANK_POOL = 20  # max candidates fed into the cross-encoder
+RERANK_POOL = 40  # max candidates fed into the cross-encoder
 FINAL_K = 5    # chunks passed to the LLM
 
 _EXPAND_PROMPT = """\
