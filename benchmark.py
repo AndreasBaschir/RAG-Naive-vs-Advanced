@@ -11,16 +11,22 @@ Answer quality metrics (opt-in, requires LLM calls):
   answer_f1       — SQuAD token-F1 against reference answer spans
   exact_match     — SQuAD exact match against reference answer spans
 
+RAGAS metrics (opt-in, implies --with-generation, very slow):
+  faithfulness      — how well the answer is grounded in the retrieved context
+  answer_relevancy  — how relevant the answer is to the question
+
 Usage:
   python benchmark.py
   python benchmark.py --samples 100
-  python benchmark.py --with-generation --samples 50 --output results.json
+  python benchmark.py --with-generation --samples 50
+  python benchmark.py --with-ragas --samples 50 --output results.json
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import string
 import time
@@ -45,9 +51,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--with-generation", action="store_true",
                         help="Also evaluate answer quality (slow — one LLM call per question per pipeline)")
+    parser.add_argument("--with-ragas", action="store_true",
+                        help="Run RAGAS faithfulness and answer_relevancy (implies --with-generation, very slow)")
     parser.add_argument("--output", metavar="FILE",
                         help="Save full results to a JSON file")
     args = parser.parse_args()
+
+    if args.with_ragas:
+        args.with_generation = True
 
     print("Loading SQuAD training split...")
     dataset = load_dataset("rajpurkar/squad", split="train")
@@ -57,8 +68,6 @@ def main() -> None:
     sample = rng.sample(rows, min(args.samples, len(rows)))
     print(f"Sampled {len(sample)} questions (seed={args.seed}).")
 
-    # Warm up both pipelines so model loading / BM25 index build
-    # doesn't skew the first few timing measurements.
     print("Warming up pipelines (loads models + BM25 index)...")
     naive.retrieve("warm-up query")
     adv.retrieve("warm-up query")
@@ -66,6 +75,7 @@ def main() -> None:
 
     pipelines = [("naive", naive), ("advanced", adv)]
     records: list[dict] = []
+    ragas_rows: dict[str, list[dict]] = {"naive": [], "advanced": []}
 
     for i, row in enumerate(sample):
         question: str = row["question"]
@@ -103,14 +113,27 @@ def main() -> None:
                 )
                 entry["em"] = any(_exact_match(answer, ref) for ref in gold_answers)
 
+                if args.with_ragas:
+                    ragas_rows[name].append({
+                        "question": question,
+                        "answer": answer,
+                        "contexts": [c["text"] for c in chunks],
+                    })
+
             record[name] = entry
 
         records.append(record)
         _print_progress(i + 1, len(sample))
 
     print()
-    summary = _build_summary(records, args.with_generation)
-    _print_results(summary, args.with_generation)
+
+    ragas_scores: dict = {}
+    if args.with_ragas:
+        print("\nRunning RAGAS evaluation (this may take several minutes)...")
+        ragas_scores = _run_ragas(ragas_rows)
+
+    summary = _build_summary(records, args.with_generation, ragas_scores)
+    _print_results(summary, args.with_generation, bool(ragas_scores))
 
     if args.output:
         with open(args.output, "w") as fh:
@@ -119,11 +142,63 @@ def main() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# RAGAS evaluation                                                             #
+# --------------------------------------------------------------------------- #
+
+def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b") -> dict:
+    try:
+        from ragas import EvaluationDataset, SingleTurnSample, evaluate
+        from ragas.llms import LangchainLLMWrapper
+        from ragas.embeddings import LangchainEmbeddingsWrapper
+        from ragas.metrics import Faithfulness, ResponseRelevancy
+        from langchain_ollama import ChatOllama
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+    except ImportError as exc:
+        print(f"\nRAGAS dependencies missing: {exc}")
+        print("Install with: pip install ragas langchain-ollama langchain-community")
+        return {}
+
+    llm = LangchainLLMWrapper(ChatOllama(model=llm_model))
+    embeddings = LangchainEmbeddingsWrapper(
+        HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    )
+
+    results: dict = {}
+    for name, rows in rows_by_pipeline.items():
+        if not rows:
+            continue
+        print(f"  Evaluating {name} RAG ({len(rows)} samples)...")
+        samples = [
+            SingleTurnSample(
+                user_input=r["question"],
+                response=r["answer"],
+                retrieved_contexts=r["contexts"],
+            )
+            for r in rows
+        ]
+        dataset = EvaluationDataset(samples=samples)
+        result = evaluate(
+            dataset=dataset,
+            metrics=[Faithfulness(), ResponseRelevancy()],
+            llm=llm,
+            embeddings=embeddings,
+        )
+        df = result.to_pandas()
+        faith_vals = [v for v in df["faithfulness"] if not math.isnan(v)]
+        relev_vals = [v for v in df["answer_relevancy"] if not math.isnan(v)]
+        results[name] = {
+            "faithfulness": round(_avg(faith_vals), 4),
+            "answer_relevancy": round(_avg(relev_vals), 4),
+        }
+
+    return results
+
+
+# --------------------------------------------------------------------------- #
 # Metrics                                                                      #
 # --------------------------------------------------------------------------- #
 
 def _context_rank(chunks: list[dict], gold_context: str) -> int | None:
-    """1-based rank of the gold passage in the retrieved list, or None."""
     gold = gold_context.strip()
     for i, chunk in enumerate(chunks):
         if chunk["text"].strip() == gold:
@@ -160,7 +235,7 @@ def _avg(values: list) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def _build_summary(records: list[dict], with_generation: bool) -> dict:
+def _build_summary(records: list[dict], with_generation: bool, ragas_scores: dict) -> dict:
     summary = {}
     for name in ("naive", "advanced"):
         entries = [r[name] for r in records]
@@ -173,11 +248,14 @@ def _build_summary(records: list[dict], with_generation: bool) -> dict:
         if with_generation:
             s["answer_f1"] = round(_avg([e.get("f1", 0.0) for e in entries]), 4)
             s["exact_match"] = round(_avg([float(e.get("em", False)) for e in entries]), 4)
+        if name in ragas_scores:
+            s["faithfulness"] = ragas_scores[name]["faithfulness"]
+            s["answer_relevancy"] = ragas_scores[name]["answer_relevancy"]
         summary[name] = s
     return summary
 
 
-def _print_results(summary: dict, with_generation: bool) -> None:
+def _print_results(summary: dict, with_generation: bool, with_ragas: bool) -> None:
     n = summary["naive"]
     a = summary["advanced"]
     w = 62
@@ -194,6 +272,10 @@ def _print_results(summary: dict, with_generation: bool) -> None:
         print("-" * w)
         print(f"{'Answer F1':<30} {n['answer_f1']:>14.3f} {a['answer_f1']:>14.3f}")
         print(f"{'Exact Match':<30} {n['exact_match']:>14.3f} {a['exact_match']:>14.3f}")
+    if with_ragas:
+        print("-" * w)
+        print(f"{'RAGAS Faithfulness':<30} {n['faithfulness']:>14.3f} {a['faithfulness']:>14.3f}")
+        print(f"{'RAGAS Answer Relevancy':<30} {n['answer_relevancy']:>14.3f} {a['answer_relevancy']:>14.3f}")
     print("=" * w)
 
 
