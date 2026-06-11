@@ -17,6 +17,13 @@ TOP_K = 5
 LLM_MODEL = "qwen3:8b"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+_SYSTEM_PROMPT = (
+    "You are a precise, factual assistant. "
+    "Answer the user's question using ONLY the information in the provided context. "
+    "If the context does not contain enough information to answer, reply with exactly: "
+    "\"The provided context does not contain enough information to answer this question.\""
+)
+
 _embedder: SentenceTransformer | None = None
 _collection: chromadb.Collection | None = None
 
@@ -60,11 +67,13 @@ def retrieve(query: str) -> list[dict]:
 
 def stream(query: str, chunks: list[dict]) -> Generator[str, None, None]:
     context = "\n\n".join(c["text"] for c in chunks)
-    prompt = f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
 
     for part in ollama.chat(
         model=LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"},
+        ],
         stream=True,
     ):
         yield part["message"]["content"]
