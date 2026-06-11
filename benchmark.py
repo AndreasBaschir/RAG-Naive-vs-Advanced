@@ -99,7 +99,7 @@ def main() -> None:
             chunks = pipeline.retrieve(question)
             retrieval_ms = (time.perf_counter() - t0) * 1000
 
-            rank = _context_rank(chunks, gold_context)
+            rank = _context_rank(chunks, gold_answers)
 
             entry: dict = {
                 "retrieval_ms": round(retrieval_ms, 2),
@@ -395,10 +395,11 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool, out_di
 # Metrics                                                                      #
 # --------------------------------------------------------------------------- #
 
-def _context_rank(chunks: list[dict], gold_context: str) -> int | None:
-    gold = gold_context.strip()
+def _context_rank(chunks: list[dict], gold_answers: list[str]) -> int | None:
+    """1-based rank of the first chunk that contains any gold answer span, or None."""
     for i, chunk in enumerate(chunks):
-        if chunk["text"].strip() == gold:
+        text = chunk["text"].lower()
+        if any(ans.lower() in text for ans in gold_answers):
             return i + 1
     return None
 
