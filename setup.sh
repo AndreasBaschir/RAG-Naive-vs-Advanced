@@ -15,10 +15,14 @@ echo "Python version:"
 python3 --version
 echo ""
 
-# Create virtual environment
-echo "Creating virtual environment..."
-python3 -m venv venv
-echo "Virtual environment created."
+# Create virtual environment (skip if already valid)
+if [ -d "venv" ] && venv/bin/python --version &> /dev/null; then
+    echo "Virtual environment already exists, skipping creation."
+else
+    echo "Creating virtual environment..."
+    python3 -m venv venv
+    echo "Virtual environment created."
+fi
 echo ""
 
 # Activate virtual environment
