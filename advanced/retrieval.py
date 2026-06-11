@@ -18,7 +18,7 @@ CHROMA_PATH = ROOT / "data" / "chroma"
 COLLECTION_NAME = "squad"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-2-v2"  # L-2 is ~3x faster than L-6
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 _embedder: SentenceTransformer | None = None
