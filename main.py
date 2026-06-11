@@ -4,7 +4,19 @@ from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
 
 from advanced import pipeline as adv
+from advanced.retrieval import _get_bm25, _get_embedder as _adv_embedder, _get_reranker
 from naive import pipeline as naive
+
+
+@st.cache_resource
+def _warmup():
+    naive._get_embedder()
+    _adv_embedder()
+    _get_reranker()
+    _get_bm25()
+
+
+_warmup()
 
 st.set_page_config(layout="wide", page_title="Naive vs Advanced RAG")
 st.title("Naive vs Advanced RAG")
