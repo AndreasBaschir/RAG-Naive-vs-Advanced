@@ -1,5 +1,6 @@
 chromadb==1.5.9
 datasets==4.8.5
 ollama==0.6.2
+rank_bm25==0.2.2
 sentence_transformers==5.5.1
 streamlit==1.57.0
