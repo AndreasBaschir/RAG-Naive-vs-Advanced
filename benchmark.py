@@ -166,6 +166,10 @@ def main() -> None:
 
         per_seed_summaries.append(_build_summary(records, args.with_generation, ragas_scores))
 
+        # Write a checkpoint after every seed so a crash doesn't lose all work.
+        if args.output:
+            _write_checkpoint(args.output, per_seed_summaries, all_records, seeds)
+
     # Aggregate across seeds. Display flags are derived from the aggregated
     # summary so a metric only shows up when it survived for every seed.
     final_summary = _aggregate_summaries(per_seed_summaries)
@@ -174,7 +178,7 @@ def main() -> None:
     has_ragas = "faithfulness" in final_summary["naive"]
 
     print()
-    _print_results(final_summary, has_generation, has_ragas, multi_seed)
+    _print_results(final_summary, has_generation, has_ragas, multi_seed, len(seeds))
 
     sig_tests = _significance_tests(all_records, has_generation)
     _print_significance(sig_tests)
@@ -192,12 +196,25 @@ def main() -> None:
 
     if args.plot:
         _plot_results(final_summary, has_generation, has_ragas,
-                      args.figures_dir, multi_seed)
+                      args.figures_dir, multi_seed, len(seeds))
 
 
 # --------------------------------------------------------------------------- #
 # Aggregation                                                                  #
 # --------------------------------------------------------------------------- #
+
+def _write_checkpoint(path: str, per_seed_summaries: list[dict],
+                      all_records: list[dict], seeds: list[int]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({
+            "seeds_completed": len(per_seed_summaries),
+            "seeds": seeds,
+            "per_seed_summaries": per_seed_summaries,
+            "records": all_records,
+        }, fh, indent=2)
+    os.replace(tmp, path)  # atomic replace — no partial-write corruption
+
 
 def _aggregate_summaries(summaries: list[dict]) -> dict:
     """Mean ± sample-std across per-seed summaries. Single seed → std omitted.
@@ -259,7 +276,9 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b") -> dict:
 
         # Drop grounded refusals: scoring them for answer_relevancy unfairly
         # penalises a pipeline for correctly declining to answer.
-        usable = [r for r in rows if REFUSAL_MARKER not in r["answer"].lower()]
+        usable = [r for r in rows
+                  if REFUSAL_MARKER not in r["answer"].lower()
+                  and not r["answer"].startswith("[ERROR:")]
         excluded = len(rows) - len(usable)
         if excluded:
             print(f"    ({name}: {excluded}/{len(rows)} refusal answers excluded from RAGAS)")
@@ -299,7 +318,7 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b") -> dict:
 # --------------------------------------------------------------------------- #
 
 def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
-                  out_dir: str, multi_seed: bool) -> None:
+                  out_dir: str, multi_seed: bool, num_seeds: int = DEFAULT_NUM_SEEDS) -> None:
     try:
         import matplotlib.pyplot as plt
         import matplotlib.ticker as mticker
@@ -379,7 +398,7 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
     ax.set_ylabel("Scor")
     ax.set_title("Metrici de Regăsire")
     if multi_seed:
-        ax.set_xlabel(f"medie ± std  ({DEFAULT_NUM_SEEDS} seed-uri)")
+        ax.set_xlabel(f"medie ± std  ({num_seeds} seed-uri)")
     fig.tight_layout()
     _save(fig, "retrieval_metrics")
 
@@ -425,7 +444,7 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
         ax.set_ylabel("Scor")
         ax.set_title("Calitatea Răspunsurilor")
         if multi_seed:
-            ax.set_xlabel(f"medie ± std  ({DEFAULT_NUM_SEEDS} seed-uri)")
+            ax.set_xlabel(f"medie ± std  ({num_seeds} seed-uri)")
         fig.tight_layout()
         _save(fig, "answer_quality")
 
@@ -447,7 +466,7 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
         ax.set_ylabel("Scor RAGAS")
         ax.set_title("Metrici RAGAS")
         if multi_seed:
-            ax.set_xlabel(f"medie ± std  ({DEFAULT_NUM_SEEDS} seed-uri)")
+            ax.set_xlabel(f"medie ± std  ({num_seeds} seed-uri)")
         fig.tight_layout()
         _save(fig, "ragas_metrics")
 
@@ -581,14 +600,14 @@ def _fmt(summary: dict, key: str, multi_seed: bool) -> str:
 
 
 def _print_results(summary: dict, with_generation: bool, with_ragas: bool,
-                   multi_seed: bool) -> None:
+                   multi_seed: bool, num_seeds: int = DEFAULT_NUM_SEEDS) -> None:
     n = summary["naive"]
     a = summary["advanced"]
     col_w = 18 if multi_seed else 14
     w = 30 + col_w * 2 + 2
 
     header = f"{'Naive RAG':>{col_w}} {'Advanced RAG':>{col_w}}"
-    seeds_note = f"  ({DEFAULT_NUM_SEEDS} seeds × {n['n']} questions each)" if multi_seed else f"  ({n['n']} questions)"
+    seeds_note = f"  ({num_seeds} seeds × {n['n']} questions each)" if multi_seed else f"  ({n['n']} questions)"
 
     print("=" * w)
     print(f"  Benchmark results{seeds_note}")
@@ -689,7 +708,11 @@ def _print_progress(current: int, total: int) -> None:
     bar_len = 38
     filled  = int(bar_len * pct)
     bar     = "█" * filled + "░" * (bar_len - filled)
-    print(f"\r  [{bar}] {current}/{total}", end="", flush=True)
+    import sys
+    if sys.stdout.isatty():
+        print(f"\r  [{bar}] {current}/{total}", end="", flush=True)
+    elif current == total:
+        print(f"  [{bar}] {current}/{total}", flush=True)
 
 
 if __name__ == "__main__":
