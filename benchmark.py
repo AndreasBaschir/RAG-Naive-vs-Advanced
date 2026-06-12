@@ -266,6 +266,15 @@ def _ragas_from_file(args) -> None:
                 updated[name]["answer_relevancy"] = ragas_scores[name]["answer_relevancy"]
         updated_summaries.append(updated)
 
+        # Checkpoint after each seed's RAGAS so a crash mid-run isn't fatal.
+        if args.output:
+            data["per_seed_summaries"] = updated_summaries + per_seed_summaries[len(updated_summaries):]
+            tmp = args.output + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(data, fh, indent=2)
+            os.replace(tmp, args.output)
+            print(f"  Checkpoint saved ({len(updated_summaries)}/{len(seeds)} seeds).")
+
     final_summary = _aggregate_summaries(updated_summaries)
     has_generation = "answer_f1" in final_summary["naive"]
     has_ragas = "faithfulness" in final_summary["naive"]
@@ -352,7 +361,11 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b",
         print("Install with: pip install ragas langchain-ollama langchain-community")
         return {}
 
-    llm = LangchainLLMWrapper(ChatOllama(model=llm_model))
+    # num_ctx is kept small on purpose: RAGAS prompts (a question + a few SQuAD
+    # passages) are well under 4K tokens, so qwen3's 40K default just wastes
+    # ~15GB of KV cache and blocks parallel slots. A small context lets several
+    # requests run concurrently within the A5000's 24GB.
+    llm = LangchainLLMWrapper(ChatOllama(model=llm_model, num_ctx=4096))
     embeddings = LangchainEmbeddingsWrapper(
         HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     )
