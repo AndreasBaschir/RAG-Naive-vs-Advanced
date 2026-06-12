@@ -3,9 +3,12 @@
 Benchmark: Naive RAG vs Advanced RAG on a sample from the SQuAD training set.
 
 Retrieval metrics (always computed):
-  context_recall  — fraction of questions where the gold passage appears in top-K
-  mrr             — Mean Reciprocal Rank of the gold passage
-  avg_retrieval_ms — mean retrieval latency in milliseconds
+  context_recall  — fraction of questions where a gold answer span appears in
+                    a top-K chunk from the correct article
+  mrr             — Mean Reciprocal Rank of the first such chunk
+  avg_retrieval_ms — mean query-processing latency in milliseconds. NOTE: for the
+                    Advanced pipeline this includes the multi-query expansion LLM
+                    call, not just vector/BM25 retrieval.
 
 Answer quality metrics (opt-in, requires LLM calls):
   answer_f1       — SQuAD token-F1 against reference answer spans
@@ -15,9 +18,11 @@ RAGAS metrics (opt-in, implies --with-generation, very slow):
   faithfulness      — how well the answer is grounded in the retrieved context
   answer_relevancy  — how relevant the answer is to the question
 
+Results are reported as mean ± std across all seeds.
+
 Usage:
   python benchmark.py
-  python benchmark.py --samples 100
+  python benchmark.py --samples 100 --num-seeds 4
   python benchmark.py --with-generation --samples 50
   python benchmark.py --with-ragas --samples 50 --output results.json
   python benchmark.py --with-ragas --samples 50 --plot --figures-dir figures/
@@ -30,6 +35,7 @@ import json
 import math
 import os
 import random
+import statistics
 import string
 import time
 from collections import Counter
@@ -41,6 +47,12 @@ from naive import pipeline as naive
 
 DEFAULT_SAMPLES = 200
 DEFAULT_SEED = 42
+DEFAULT_NUM_SEEDS = 4
+
+# Substring that identifies a grounded "I can't answer from context" refusal,
+# emitted by both pipelines' system prompts. Such answers must be excluded from
+# RAGAS answer_relevancy, which would otherwise penalise a correct refusal.
+REFUSAL_MARKER = "does not contain enough information"
 
 
 def main() -> None:
@@ -49,8 +61,11 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES,
-                        help=f"Questions to evaluate (default: {DEFAULT_SAMPLES})")
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+                        help=f"Questions per seed (default: {DEFAULT_SAMPLES})")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                        help=f"Base random seed (default: {DEFAULT_SEED})")
+    parser.add_argument("--num-seeds", type=int, default=DEFAULT_NUM_SEEDS,
+                        help=f"Number of seeds to run (default: {DEFAULT_NUM_SEEDS})")
     parser.add_argument("--with-generation", action="store_true",
                         help="Also evaluate answer quality (slow — one LLM call per question per pipeline)")
     parser.add_argument("--with-ragas", action="store_true",
@@ -66,13 +81,12 @@ def main() -> None:
     if args.with_ragas:
         args.with_generation = True
 
+    # Derive reproducible seeds from the base seed
+    seeds = [args.seed + i * 1000 for i in range(args.num_seeds)]
+
     print("Loading SQuAD training split...")
     dataset = load_dataset("rajpurkar/squad", split="train")
     rows = list(dataset)
-
-    rng = random.Random(args.seed)
-    sample = rng.sample(rows, min(args.samples, len(rows)))
-    print(f"Sampled {len(sample)} questions (seed={args.seed}).")
 
     print("Warming up pipelines (loads models + BM25 index)...")
     naive.retrieve("warm-up query")
@@ -80,74 +94,140 @@ def main() -> None:
     print("Ready.\n")
 
     pipelines = [("naive", naive), ("advanced", adv)]
-    records: list[dict] = []
-    ragas_rows: dict[str, list[dict]] = {"naive": [], "advanced": []}
+    per_seed_summaries: list[dict] = []
+    all_records: list[dict] = []
 
-    for i, row in enumerate(sample):
-        question: str = row["question"]
-        gold_context: str = row["context"]
-        gold_answers: list[str] = row["answers"]["text"]
+    for seed_idx, seed in enumerate(seeds):
+        print(f"--- Seed {seed_idx + 1}/{len(seeds)}  (seed={seed}, {args.samples} questions) ---")
 
-        record: dict = {
-            "question": question,
-            "gold_context": gold_context,
-            "gold_answers": gold_answers,
-        }
+        rng = random.Random(seed)
+        sample = rng.sample(rows, min(args.samples, len(rows)))
 
-        for name, pipeline in pipelines:
-            t0 = time.perf_counter()
-            chunks = pipeline.retrieve(question)
-            retrieval_ms = (time.perf_counter() - t0) * 1000
+        records: list[dict] = []
+        ragas_rows: dict[str, list[dict]] = {"naive": [], "advanced": []}
 
-            rank = _context_rank(chunks, gold_answers)
+        for i, row in enumerate(sample):
+            question: str = row["question"]
+            gold_answers: list[str] = row["answers"]["text"]
+            gold_title: str = row["title"]
 
-            entry: dict = {
-                "retrieval_ms": round(retrieval_ms, 2),
-                "recall": rank is not None,
-                "mrr": round(1.0 / rank, 4) if rank is not None else 0.0,
-                "rank": rank,
+            record: dict = {
+                "question": question,
+                "gold_context": row["context"],
+                "gold_answers": gold_answers,
+                "gold_title": gold_title,
+                "seed": seed,
             }
 
-            if args.with_generation:
-                try:
-                    answer = "".join(pipeline.stream(question, chunks))
-                except Exception as exc:
-                    answer = f"[ERROR: {exc}]"
-                entry["answer"] = answer
-                entry["f1"] = round(
-                    max((_token_f1(answer, ref) for ref in gold_answers), default=0.0), 4
-                )
-                entry["em"] = any(_exact_match(answer, ref) for ref in gold_answers)
+            for name, pipeline in pipelines:
+                t0 = time.perf_counter()
+                chunks = pipeline.retrieve(question)
+                retrieval_ms = (time.perf_counter() - t0) * 1000
 
-                if args.with_ragas:
-                    ragas_rows[name].append({
-                        "question": question,
-                        "answer": answer,
-                        "contexts": [c["text"] for c in chunks],
-                    })
+                rank = _context_rank(chunks, gold_answers, gold_title)
 
-            record[name] = entry
+                entry: dict = {
+                    "retrieval_ms": round(retrieval_ms, 2),
+                    "recall": rank is not None,
+                    "mrr": round(1.0 / rank, 4) if rank is not None else 0.0,
+                    "rank": rank,
+                }
 
-        records.append(record)
-        _print_progress(i + 1, len(sample))
+                if args.with_generation:
+                    try:
+                        answer = "".join(pipeline.stream(question, chunks))
+                    except Exception as exc:
+                        answer = f"[ERROR: {exc}]"
+                    entry["answer"] = answer
+                    entry["f1"] = round(
+                        max((_token_f1(answer, ref) for ref in gold_answers), default=0.0), 4
+                    )
+                    entry["em"] = any(_exact_match(answer, ref) for ref in gold_answers)
+
+                    if args.with_ragas:
+                        ragas_rows[name].append({
+                            "question": question,
+                            "answer": answer,
+                            "contexts": [c["text"] for c in chunks],
+                        })
+
+                record[name] = entry
+
+            records.append(record)
+            _print_progress(i + 1, len(sample))
+
+        print()
+        all_records.extend(records)
+
+        ragas_scores: dict = {}
+        if args.with_ragas:
+            print(f"  Running RAGAS for seed {seed_idx + 1} (this may take several minutes)...")
+            ragas_scores = _run_ragas(ragas_rows)
+
+        per_seed_summaries.append(_build_summary(records, args.with_generation, ragas_scores))
+
+    # Aggregate across seeds. Display flags are derived from the aggregated
+    # summary so a metric only shows up when it survived for every seed.
+    final_summary = _aggregate_summaries(per_seed_summaries)
+    multi_seed = len(seeds) > 1
+    has_generation = "answer_f1" in final_summary["naive"]
+    has_ragas = "faithfulness" in final_summary["naive"]
 
     print()
+    _print_results(final_summary, has_generation, has_ragas, multi_seed)
 
-    ragas_scores: dict = {}
-    if args.with_ragas:
-        print("\nRunning RAGAS evaluation (this may take several minutes)...")
-        ragas_scores = _run_ragas(ragas_rows)
-
-    summary = _build_summary(records, args.with_generation, ragas_scores)
-    _print_results(summary, args.with_generation, bool(ragas_scores))
+    sig_tests = _significance_tests(all_records, has_generation)
+    _print_significance(sig_tests)
 
     if args.output:
         with open(args.output, "w") as fh:
-            json.dump({"summary": summary, "records": records}, fh, indent=2)
+            json.dump({
+                "summary": final_summary,
+                "per_seed_summaries": per_seed_summaries,
+                "significance": sig_tests,
+                "seeds": seeds,
+                "records": all_records,
+            }, fh, indent=2)
         print(f"\nDetailed results saved to {args.output}")
 
     if args.plot:
-        _plot_results(summary, args.with_generation, bool(ragas_scores), args.figures_dir)
+        _plot_results(final_summary, has_generation, has_ragas,
+                      args.figures_dir, multi_seed)
+
+
+# --------------------------------------------------------------------------- #
+# Aggregation                                                                  #
+# --------------------------------------------------------------------------- #
+
+def _aggregate_summaries(summaries: list[dict]) -> dict:
+    """Mean ± sample-std across per-seed summaries. Single seed → std omitted.
+
+    Only metrics present in *every* seed are aggregated, so a RAGAS failure on
+    one seed can neither crash the run nor silently corrupt the output table.
+    """
+    if len(summaries) == 1:
+        return summaries[0]
+
+    result: dict = {}
+    for name in ("naive", "advanced"):
+        pipeline_runs = [s[name] for s in summaries]
+
+        # Keep only keys present in all seeds and numeric in all seeds.
+        common_keys = set(pipeline_runs[0])
+        for r in pipeline_runs[1:]:
+            common_keys &= set(r)
+        numeric_keys = [
+            k for k in common_keys
+            if k != "n" and all(isinstance(r[k], (int, float)) for r in pipeline_runs)
+        ]
+
+        agg: dict = {"n": pipeline_runs[0]["n"]}
+        for key in numeric_keys:
+            vals = [r[key] for r in pipeline_runs]
+            agg[key] = round(_avg(vals), 4)
+            agg[f"{key}_std"] = round(_sample_std(vals), 4)
+        result[name] = agg
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -176,14 +256,25 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b") -> dict:
     for name, rows in rows_by_pipeline.items():
         if not rows:
             continue
-        print(f"  Evaluating {name} RAG ({len(rows)} samples)...")
+
+        # Drop grounded refusals: scoring them for answer_relevancy unfairly
+        # penalises a pipeline for correctly declining to answer.
+        usable = [r for r in rows if REFUSAL_MARKER not in r["answer"].lower()]
+        excluded = len(rows) - len(usable)
+        if excluded:
+            print(f"    ({name}: {excluded}/{len(rows)} refusal answers excluded from RAGAS)")
+        if not usable:
+            print(f"    ({name}: no scorable answers — skipping RAGAS)")
+            continue
+
+        print(f"    Evaluating {name} RAG ({len(usable)} samples)...")
         samples = [
             SingleTurnSample(
                 user_input=r["question"],
                 response=r["answer"],
                 retrieved_contexts=r["contexts"],
             )
-            for r in rows
+            for r in usable
         ]
         dataset = EvaluationDataset(samples=samples)
         result = evaluate(
@@ -207,7 +298,8 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b") -> dict:
 # Figures                                                                      #
 # --------------------------------------------------------------------------- #
 
-def _plot_results(summary: dict, with_generation: bool, with_ragas: bool, out_dir: str) -> None:
+def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
+                  out_dir: str, multi_seed: bool) -> None:
     try:
         import matplotlib.pyplot as plt
         import matplotlib.ticker as mticker
@@ -225,8 +317,8 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool, out_di
         plt.style.use("seaborn-whitegrid")
 
     NAIVE_COLOR = "#4C72B0"
-    ADV_COLOR = "#DD8452"
-    FONT_SIZE = 11
+    ADV_COLOR   = "#DD8452"
+    FONT_SIZE   = 11
     plt.rcParams.update({
         "font.size": FONT_SIZE,
         "axes.titlesize": FONT_SIZE + 1,
@@ -239,120 +331,132 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool, out_di
     n = summary["naive"]
     a = summary["advanced"]
 
+    def _get(d: dict, key: str) -> tuple[float, float]:
+        """Return (mean, std) for a metric. std=0 when no multi-seed."""
+        return d[key], d.get(f"{key}_std", 0.0)
+
     def _save(fig: "plt.Figure", name: str) -> None:
         for ext in ("pdf", "png"):
-            path = os.path.join(out_dir, f"{name}.{ext}")
-            fig.savefig(path, dpi=300, bbox_inches="tight")
+            fig.savefig(os.path.join(out_dir, f"{name}.{ext}"), dpi=300, bbox_inches="tight")
         print(f"  Saved {name}.pdf / {name}.png")
         plt.close(fig)
 
-    def _bar_labels(ax: "plt.Axes", bars) -> None:
-        for bar in bars:
-            h = bar.get_height()
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                h + 0.01,
-                f"{h:.3f}",
-                ha="center", va="bottom", fontsize=FONT_SIZE - 2,
-            )
+    def _grouped_bars(ax, labels, naive_vals, adv_vals,
+                      naive_errs=None, adv_errs=None) -> None:
+        x   = np.arange(len(labels))
+        w   = 0.35
+        kw  = {"capsize": 5, "error_kw": {"elinewidth": 1.2}} if multi_seed else {}
+        b1 = ax.bar(x - w / 2, naive_vals, w, label="Naive RAG",    color=NAIVE_COLOR, zorder=3,
+                    yerr=naive_errs if multi_seed else None, **kw)
+        b2 = ax.bar(x + w / 2, adv_vals,   w, label="Advanced RAG", color=ADV_COLOR,   zorder=3,
+                    yerr=adv_errs if multi_seed else None, **kw)
+        for bar, val, err in zip(list(b1) + list(b2),
+                                  naive_vals + adv_vals,
+                                  (naive_errs or [0]*len(naive_vals)) + (adv_errs or [0]*len(adv_vals))):
+            top = val + (err if multi_seed else 0) + 0.01
+            ax.text(bar.get_x() + bar.get_width() / 2, top,
+                    f"{val:.3f}", ha="center", va="bottom", fontsize=FONT_SIZE - 2)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.legend()
 
     print(f"\nGenerating figures in '{out_dir}/'...")
 
     # ------------------------------------------------------------------ #
-    # Figure 1 — Retrieval metrics (Context Recall, MRR)                 #
+    # Figure 1 — Retrieval metrics                                        #
     # ------------------------------------------------------------------ #
     fig, ax = plt.subplots(figsize=(6, 4.5))
-    labels = ["Context Recall@K", "MRR"]
-    naive_vals = [n["context_recall"], n["mrr"]]
-    adv_vals   = [a["context_recall"], a["mrr"]]
-    x = np.arange(len(labels))
-    w = 0.35
-    b1 = ax.bar(x - w / 2, naive_vals, w, label="Naive RAG",    color=NAIVE_COLOR, zorder=3)
-    b2 = ax.bar(x + w / 2, adv_vals,   w, label="Advanced RAG", color=ADV_COLOR,   zorder=3)
-    _bar_labels(ax, b1)
-    _bar_labels(ax, b2)
-    ax.set_ylim(0, 1.15)
+    n_rc, n_rc_std = _get(n, "context_recall")
+    a_rc, a_rc_std = _get(a, "context_recall")
+    n_mrr, n_mrr_std = _get(n, "mrr")
+    a_mrr, a_mrr_std = _get(a, "mrr")
+    _grouped_bars(ax,
+                  ["Context Recall@K", "MRR"],
+                  [n_rc, n_mrr], [a_rc, a_mrr],
+                  [n_rc_std, n_mrr_std], [a_rc_std, a_mrr_std])
+    ax.set_ylim(0, 1.2)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
     ax.set_ylabel("Scor")
     ax.set_title("Metrici de Regăsire")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.legend()
+    if multi_seed:
+        ax.set_xlabel(f"medie ± std  ({DEFAULT_NUM_SEEDS} seed-uri)")
     fig.tight_layout()
     _save(fig, "retrieval_metrics")
 
     # ------------------------------------------------------------------ #
-    # Figure 2 — Retrieval latency                                        #
+    # Figure 2 — Latency                                                  #
     # ------------------------------------------------------------------ #
     fig, ax = plt.subplots(figsize=(5, 4))
-    pipeline_labels = ["Naive RAG", "Advanced RAG"]
-    latencies = [n["avg_retrieval_ms"], a["avg_retrieval_ms"]]
-    bars = ax.bar(pipeline_labels, latencies, color=[NAIVE_COLOR, ADV_COLOR], width=0.4, zorder=3)
+    n_lat, n_lat_std = _get(n, "avg_retrieval_ms")
+    a_lat, a_lat_std = _get(a, "avg_retrieval_ms")
+    pipeline_labels  = ["Naive RAG", "Advanced RAG"]
+    latencies        = [n_lat, a_lat]
+    errs             = [n_lat_std, a_lat_std] if multi_seed else None
+    bars = ax.bar(pipeline_labels, latencies,
+                  color=[NAIVE_COLOR, ADV_COLOR], width=0.4, zorder=3,
+                  yerr=errs, capsize=5 if multi_seed else 0,
+                  error_kw={"elinewidth": 1.2})
+    max_top = max(latencies[i] + (errs[i] if errs else 0) for i in range(2))
     for bar, val in zip(bars, latencies):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            val + max(latencies) * 0.01,
-            f"{val:.1f} ms",
-            ha="center", va="bottom", fontsize=FONT_SIZE - 1,
-        )
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                val + max_top * 0.02,
+                f"{val:.1f} ms", ha="center", va="bottom", fontsize=FONT_SIZE - 1)
     ax.set_ylabel("Latență medie (ms)")
-    ax.set_title("Latența Medie de Regăsire")
-    ax.set_ylim(0, max(latencies) * 1.2)
+    ax.set_title("Latența Medie de Procesare a Interogării")
+    ax.set_ylim(0, max_top * 1.25)
     fig.tight_layout()
     _save(fig, "latency")
 
     # ------------------------------------------------------------------ #
-    # Figure 3 — Answer quality (F1, EM) — only with --with-generation   #
+    # Figure 3 — Answer quality                                           #
     # ------------------------------------------------------------------ #
     if with_generation:
         fig, ax = plt.subplots(figsize=(6, 4.5))
-        labels = ["Answer F1", "Exact Match"]
-        naive_vals = [n["answer_f1"], n["exact_match"]]
-        adv_vals   = [a["answer_f1"], a["exact_match"]]
-        x = np.arange(len(labels))
-        b1 = ax.bar(x - w / 2, naive_vals, w, label="Naive RAG",    color=NAIVE_COLOR, zorder=3)
-        b2 = ax.bar(x + w / 2, adv_vals,   w, label="Advanced RAG", color=ADV_COLOR,   zorder=3)
-        _bar_labels(ax, b1)
-        _bar_labels(ax, b2)
-        ax.set_ylim(0, 1.15)
+        n_f1, n_f1_std = _get(n, "answer_f1")
+        a_f1, a_f1_std = _get(a, "answer_f1")
+        n_em, n_em_std = _get(n, "exact_match")
+        a_em, a_em_std = _get(a, "exact_match")
+        _grouped_bars(ax,
+                      ["Answer F1", "Exact Match"],
+                      [n_f1, n_em], [a_f1, a_em],
+                      [n_f1_std, n_em_std], [a_f1_std, a_em_std])
+        ax.set_ylim(0, 1.2)
         ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
         ax.set_ylabel("Scor")
         ax.set_title("Calitatea Răspunsurilor")
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels)
-        ax.legend()
+        if multi_seed:
+            ax.set_xlabel(f"medie ± std  ({DEFAULT_NUM_SEEDS} seed-uri)")
         fig.tight_layout()
         _save(fig, "answer_quality")
 
     # ------------------------------------------------------------------ #
-    # Figure 4 — RAGAS metrics — only with --with-ragas                  #
+    # Figure 4 — RAGAS metrics                                            #
     # ------------------------------------------------------------------ #
     if with_ragas:
         fig, ax = plt.subplots(figsize=(6, 4.5))
-        labels = ["Faithfulness", "Answer Relevancy"]
-        naive_vals = [n["faithfulness"], n["answer_relevancy"]]
-        adv_vals   = [a["faithfulness"], a["answer_relevancy"]]
-        x = np.arange(len(labels))
-        b1 = ax.bar(x - w / 2, naive_vals, w, label="Naive RAG",    color=NAIVE_COLOR, zorder=3)
-        b2 = ax.bar(x + w / 2, adv_vals,   w, label="Advanced RAG", color=ADV_COLOR,   zorder=3)
-        _bar_labels(ax, b1)
-        _bar_labels(ax, b2)
-        ax.set_ylim(0, 1.15)
+        n_fa, n_fa_std = _get(n, "faithfulness")
+        a_fa, a_fa_std = _get(a, "faithfulness")
+        n_ar, n_ar_std = _get(n, "answer_relevancy")
+        a_ar, a_ar_std = _get(a, "answer_relevancy")
+        _grouped_bars(ax,
+                      ["Faithfulness", "Answer Relevancy"],
+                      [n_fa, n_ar], [a_fa, a_ar],
+                      [n_fa_std, n_ar_std], [a_fa_std, a_ar_std])
+        ax.set_ylim(0, 1.2)
         ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
         ax.set_ylabel("Scor RAGAS")
         ax.set_title("Metrici RAGAS")
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels)
-        ax.legend()
+        if multi_seed:
+            ax.set_xlabel(f"medie ± std  ({DEFAULT_NUM_SEEDS} seed-uri)")
         fig.tight_layout()
         _save(fig, "ragas_metrics")
 
     # ------------------------------------------------------------------ #
-    # Figure 5 — Overview radar chart (all normalised metrics)           #
+    # Figure 5 — Radar overview                                           #
     # ------------------------------------------------------------------ #
     metric_names: list[str] = ["Context\nRecall@K", "MRR"]
-    naive_radar: list[float] = [n["context_recall"], n["mrr"]]
-    adv_radar:   list[float] = [a["context_recall"], a["mrr"]]
+    naive_radar:  list[float] = [n["context_recall"], n["mrr"]]
+    adv_radar:    list[float] = [a["context_recall"], a["mrr"]]
 
     if with_generation:
         metric_names += ["Answer F1", "Exact\nMatch"]
@@ -363,11 +467,10 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool, out_di
         naive_radar  += [n["faithfulness"], n["answer_relevancy"]]
         adv_radar    += [a["faithfulness"], a["answer_relevancy"]]
 
-    # Normalise latency: score = min_latency / latency  (higher = faster)
-    min_lat = min(n["avg_retrieval_ms"], a["avg_retrieval_ms"])
-    metric_names.append("Viteză\nregăsire")
-    naive_radar.append(round(min_lat / n["avg_retrieval_ms"], 4))
-    adv_radar.append(round(min_lat / a["avg_retrieval_ms"], 4))
+    # NOTE: latency is intentionally omitted from the radar. It lives on a
+    # different (millisecond) scale and would only be representable as a
+    # relative ratio, which mixes absolute quality scores with a relative one
+    # on the same 0-1 axis and misleads the reader. See the latency figure.
 
     num_vars = len(metric_names)
     angles = [i * 2 * math.pi / num_vars for i in range(num_vars)]
@@ -376,10 +479,10 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool, out_di
     adv_radar   += adv_radar[:1]
 
     fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={"projection": "polar"})
-    ax.plot(angles, naive_radar, color=NAIVE_COLOR, linewidth=2, linestyle="solid", label="Naive RAG")
+    ax.plot(angles, naive_radar, color=NAIVE_COLOR, linewidth=2, label="Naive RAG")
     ax.fill(angles, naive_radar, color=NAIVE_COLOR, alpha=0.15)
-    ax.plot(angles, adv_radar, color=ADV_COLOR, linewidth=2, linestyle="solid", label="Advanced RAG")
-    ax.fill(angles, adv_radar, color=ADV_COLOR, alpha=0.15)
+    ax.plot(angles, adv_radar,   color=ADV_COLOR,   linewidth=2, label="Advanced RAG")
+    ax.fill(angles, adv_radar,   color=ADV_COLOR,   alpha=0.15)
     ax.set_thetagrids([a * 180 / math.pi for a in angles[:-1]], metric_names)
     ax.set_ylim(0, 1)
     ax.set_title("Prezentare Generală a Metricilor", pad=20)
@@ -395,11 +498,22 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool, out_di
 # Metrics                                                                      #
 # --------------------------------------------------------------------------- #
 
-def _context_rank(chunks: list[dict], gold_answers: list[str]) -> int | None:
-    """1-based rank of the first chunk that contains any gold answer span, or None."""
+def _context_rank(chunks: list[dict], gold_answers: list[str],
+                  gold_title: str | None = None) -> int | None:
+    """
+    1-based rank of the first chunk that contains a gold answer span, or None.
+
+    When gold_title is given, a chunk only counts if it also comes from the
+    correct SQuAD article. This prevents short answer spans (e.g. "May", "US")
+    from spuriously matching unrelated passages and inflating recall.
+    """
+    golds = [a.lower() for a in gold_answers]
+    title = gold_title.strip().lower() if gold_title else None
     for i, chunk in enumerate(chunks):
+        if title is not None and chunk.get("source", "").strip().lower() != title:
+            continue
         text = chunk["text"].lower()
-        if any(ans.lower() in text for ans in gold_answers):
+        if any(ans in text for ans in golds):
             return i + 1
     return None
 
@@ -411,13 +525,13 @@ def _normalize(text: str) -> str:
 
 def _token_f1(prediction: str, reference: str) -> float:
     pred_tokens = _normalize(prediction).split()
-    ref_tokens = _normalize(reference).split()
-    common = Counter(pred_tokens) & Counter(ref_tokens)
-    num_common = sum(common.values())
+    ref_tokens  = _normalize(reference).split()
+    common      = Counter(pred_tokens) & Counter(ref_tokens)
+    num_common  = sum(common.values())
     if num_common == 0 or not pred_tokens or not ref_tokens:
         return 0.0
     precision = num_common / len(pred_tokens)
-    recall = num_common / len(ref_tokens)
+    recall    = num_common / len(ref_tokens)
     return 2 * precision * recall / (precision + recall)
 
 
@@ -433,6 +547,11 @@ def _avg(values: list) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _sample_std(values: list) -> float:
+    """Sample standard deviation (ddof=1). Returns 0.0 for <2 values."""
+    return statistics.stdev(values) if len(values) > 1 else 0.0
+
+
 def _build_summary(records: list[dict], with_generation: bool, ragas_scores: dict) -> dict:
     summary = {}
     for name in ("naive", "advanced"):
@@ -440,48 +559,136 @@ def _build_summary(records: list[dict], with_generation: bool, ragas_scores: dic
         s: dict = {
             "n": len(entries),
             "context_recall": round(_avg([e["recall"] for e in entries]), 4),
-            "mrr": round(_avg([e["mrr"] for e in entries]), 4),
+            "mrr":            round(_avg([e["mrr"]    for e in entries]), 4),
             "avg_retrieval_ms": round(_avg([e["retrieval_ms"] for e in entries]), 2),
         }
         if with_generation:
-            s["answer_f1"] = round(_avg([e.get("f1", 0.0) for e in entries]), 4)
-            s["exact_match"] = round(_avg([float(e.get("em", False)) for e in entries]), 4)
+            s["answer_f1"]   = round(_avg([e.get("f1",  0.0)          for e in entries]), 4)
+            s["exact_match"] = round(_avg([float(e.get("em", False))   for e in entries]), 4)
         if name in ragas_scores:
-            s["faithfulness"] = ragas_scores[name]["faithfulness"]
+            s["faithfulness"]     = ragas_scores[name]["faithfulness"]
             s["answer_relevancy"] = ragas_scores[name]["answer_relevancy"]
         summary[name] = s
     return summary
 
 
-def _print_results(summary: dict, with_generation: bool, with_ragas: bool) -> None:
+def _fmt(summary: dict, key: str, multi_seed: bool) -> str:
+    mean = summary[key]
+    std  = summary.get(f"{key}_std")
+    if multi_seed and std is not None:
+        return f"{mean:.3f} ± {std:.3f}"
+    return f"{mean:.3f}"
+
+
+def _print_results(summary: dict, with_generation: bool, with_ragas: bool,
+                   multi_seed: bool) -> None:
     n = summary["naive"]
     a = summary["advanced"]
-    w = 62
+    col_w = 18 if multi_seed else 14
+    w = 30 + col_w * 2 + 2
+
+    header = f"{'Naive RAG':>{col_w}} {'Advanced RAG':>{col_w}}"
+    seeds_note = f"  ({DEFAULT_NUM_SEEDS} seeds × {n['n']} questions each)" if multi_seed else f"  ({n['n']} questions)"
 
     print("=" * w)
-    print(f"  Benchmark results  —  {n['n']} questions")
+    print(f"  Benchmark results{seeds_note}")
     print("=" * w)
-    print(f"{'Metric':<30} {'Naive RAG':>14} {'Advanced RAG':>14}")
+    print(f"{'Metric':<30} {header}")
     print("-" * w)
-    print(f"{'Context Recall@K':<30} {n['context_recall']:>14.3f} {a['context_recall']:>14.3f}")
-    print(f"{'MRR':<30} {n['mrr']:>14.3f} {a['mrr']:>14.3f}")
-    print(f"{'Avg Retrieval (ms)':<30} {n['avg_retrieval_ms']:>13.1f}ms {a['avg_retrieval_ms']:>13.1f}ms")
+
+    def row(label: str, key: str) -> None:
+        nv = _fmt(n, key, multi_seed)
+        av = _fmt(a, key, multi_seed)
+        print(f"{label:<30} {nv:>{col_w}} {av:>{col_w}}")
+
+    row("Context Recall@K",   "context_recall")
+    row("MRR",                "mrr")
+
+    lat_n = f"{n['avg_retrieval_ms']:.1f}" + (f" ± {n['avg_retrieval_ms_std']:.1f}" if multi_seed and 'avg_retrieval_ms_std' in n else "") + " ms"
+    lat_a = f"{a['avg_retrieval_ms']:.1f}" + (f" ± {a['avg_retrieval_ms_std']:.1f}" if multi_seed and 'avg_retrieval_ms_std' in a else "") + " ms"
+    print(f"{'Avg Query Processing (ms)':<30} {lat_n:>{col_w}} {lat_a:>{col_w}}")
+
     if with_generation:
         print("-" * w)
-        print(f"{'Answer F1':<30} {n['answer_f1']:>14.3f} {a['answer_f1']:>14.3f}")
-        print(f"{'Exact Match':<30} {n['exact_match']:>14.3f} {a['exact_match']:>14.3f}")
+        row("Answer F1",   "answer_f1")
+        row("Exact Match", "exact_match")
     if with_ragas:
         print("-" * w)
-        print(f"{'RAGAS Faithfulness':<30} {n['faithfulness']:>14.3f} {a['faithfulness']:>14.3f}")
-        print(f"{'RAGAS Answer Relevancy':<30} {n['answer_relevancy']:>14.3f} {a['answer_relevancy']:>14.3f}")
+        row("RAGAS Faithfulness",     "faithfulness")
+        row("RAGAS Answer Relevancy", "answer_relevancy")
     print("=" * w)
+
+
+def _significance_tests(records: list[dict], with_generation: bool) -> dict:
+    """
+    Paired Advanced-vs-Naive significance tests over the pooled per-question
+    results (all seeds combined):
+
+      continuous metrics (mrr, answer_f1) — Wilcoxon signed-rank test
+      binary metrics (recall, exact_match) — McNemar test (exact binomial)
+
+    Returns {} if scipy is unavailable.
+    """
+    try:
+        from scipy.stats import binomtest, wilcoxon
+    except ImportError:
+        print("\nscipy not installed — skipping significance tests.")
+        print("Install with: pip install scipy")
+        return {}
+
+    tests: dict = {}
+
+    continuous = [("MRR", "mrr")]
+    if with_generation:
+        continuous.append(("Answer F1", "f1"))
+    for label, key in continuous:
+        naive_vals = [r["naive"][key] for r in records]
+        adv_vals = [r["advanced"][key] for r in records]
+        if all(av == nv for av, nv in zip(adv_vals, naive_vals)):
+            p = float("nan")  # wilcoxon errors on all-zero differences
+        else:
+            try:
+                _, p = wilcoxon(adv_vals, naive_vals)
+            except ValueError:
+                p = float("nan")
+        tests[label] = {"test": "Wilcoxon", "p": p, "n": len(records)}
+
+    binary = [("Context Recall@K", "recall")]
+    if with_generation:
+        binary.append(("Exact Match", "em"))
+    for label, key in binary:
+        # McNemar on discordant pairs: how often each pipeline alone succeeds.
+        adv_only = sum(1 for r in records if r["advanced"][key] and not r["naive"][key])
+        naive_only = sum(1 for r in records if r["naive"][key] and not r["advanced"][key])
+        discordant = adv_only + naive_only
+        p = 1.0 if discordant == 0 else binomtest(min(adv_only, naive_only), discordant, 0.5).pvalue
+        tests[label] = {
+            "test": "McNemar", "p": p, "n": len(records),
+            "adv_better": adv_only, "naive_better": naive_only,
+        }
+
+    return tests
+
+
+def _print_significance(tests: dict) -> None:
+    if not tests:
+        return
+    print("\nPaired significance tests (Advanced vs Naive, pooled questions):")
+    for metric, t in tests.items():
+        p = t["p"]
+        pstr = "n/a" if p != p else f"{p:.4g}"
+        verdict = "n.s." if (p != p or p >= 0.05) else "significant (p<0.05)"
+        extra = ""
+        if t["test"] == "McNemar":
+            extra = f"   [adv-only: {t['adv_better']}, naive-only: {t['naive_better']}]"
+        print(f"  {metric:<22} {t['test']:<9} p={pstr:<9} {verdict}{extra}")
 
 
 def _print_progress(current: int, total: int) -> None:
-    pct = current / total
+    pct    = current / total
     bar_len = 38
-    filled = int(bar_len * pct)
-    bar = "█" * filled + "░" * (bar_len - filled)
+    filled  = int(bar_len * pct)
+    bar     = "█" * filled + "░" * (bar_len - filled)
     print(f"\r  [{bar}] {current}/{total}", end="", flush=True)
 
 
