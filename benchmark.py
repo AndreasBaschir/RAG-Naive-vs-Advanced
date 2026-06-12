@@ -70,6 +70,8 @@ def main() -> None:
                         help="Also evaluate answer quality (slow — one LLM call per question per pipeline)")
     parser.add_argument("--with-ragas", action="store_true",
                         help="Run RAGAS faithfulness and answer_relevancy (implies --with-generation, very slow)")
+    parser.add_argument("--ragas-from", metavar="FILE",
+                        help="Skip retrieval/generation — load existing results.json and run only RAGAS on stored answers")
     parser.add_argument("--plot", action="store_true",
                         help="Generate thesis-ready figures (PDF + PNG) after evaluation")
     parser.add_argument("--figures-dir", default="figures",
@@ -80,6 +82,10 @@ def main() -> None:
 
     if args.with_ragas:
         args.with_generation = True
+
+    if args.ragas_from:
+        _ragas_from_file(args)
+        return
 
     # Derive reproducible seeds from the base seed
     seeds = [args.seed + i * 1000 for i in range(args.num_seeds)]
@@ -202,6 +208,84 @@ def main() -> None:
 # --------------------------------------------------------------------------- #
 # Aggregation                                                                  #
 # --------------------------------------------------------------------------- #
+
+def _ragas_from_file(args) -> None:
+    """Load a completed results.json and run RAGAS on the stored answers."""
+    with open(args.ragas_from) as fh:
+        data = json.load(fh)
+
+    all_records: list[dict] = data["records"]
+    per_seed_summaries: list[dict] = data["per_seed_summaries"]
+    seeds: list[int] = data["seeds"]
+
+    # Group records back by seed, build ragas_rows per seed
+    records_by_seed: dict[int, list[dict]] = {}
+    for r in all_records:
+        records_by_seed.setdefault(r["seed"], []).append(r)
+
+    updated_summaries = []
+    for seed_idx, (seed, summary) in enumerate(zip(seeds, per_seed_summaries)):
+        records = records_by_seed.get(seed, [])
+        ragas_rows: dict[str, list[dict]] = {"naive": [], "advanced": []}
+        for r in records:
+            for name in ("naive", "advanced"):
+                entry = r.get(name, {})
+                answer = entry.get("answer", "")
+                if answer:
+                    ragas_rows[name].append({
+                        "question": r["question"],
+                        "answer": answer,
+                        "contexts": [c["text"] for c in []] ,  # contexts not stored — use gold
+                    })
+
+        # contexts aren't stored in the JSON — rebuild from the record's gold_context
+        for name in ("naive", "advanced"):
+            ragas_rows[name] = []
+        for r in records:
+            for name in ("naive", "advanced"):
+                entry = r.get(name, {})
+                answer = entry.get("answer", "")
+                if answer:
+                    ragas_rows[name].append({
+                        "question": r["question"],
+                        "answer": answer,
+                        "contexts": [r["gold_context"]],
+                    })
+
+        print(f"Running RAGAS for seed {seed_idx + 1}/{len(seeds)} (seed={seed})...")
+        ragas_scores = _run_ragas(ragas_rows)
+
+        updated = dict(summary)
+        for name in ("naive", "advanced"):
+            if name in ragas_scores:
+                updated[name] = dict(summary[name])
+                updated[name]["faithfulness"] = ragas_scores[name]["faithfulness"]
+                updated[name]["answer_relevancy"] = ragas_scores[name]["answer_relevancy"]
+        updated_summaries.append(updated)
+
+    final_summary = _aggregate_summaries(updated_summaries)
+    has_generation = "answer_f1" in final_summary["naive"]
+    has_ragas = "faithfulness" in final_summary["naive"]
+    multi_seed = len(seeds) > 1
+
+    print()
+    _print_results(final_summary, has_generation, has_ragas, multi_seed, len(seeds))
+
+    sig_tests = _significance_tests(all_records, has_generation)
+    _print_significance(sig_tests)
+
+    if args.output:
+        data["summary"] = final_summary
+        data["per_seed_summaries"] = updated_summaries
+        data["significance"] = sig_tests
+        with open(args.output, "w") as fh:
+            json.dump(data, fh, indent=2)
+        print(f"\nUpdated results saved to {args.output}")
+
+    if args.plot:
+        _plot_results(final_summary, has_generation, has_ragas,
+                      args.figures_dir, multi_seed, len(seeds))
+
 
 def _write_checkpoint(path: str, per_seed_summaries: list[dict],
                       all_records: list[dict], seeds: list[int]) -> None:
