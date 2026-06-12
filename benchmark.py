@@ -76,6 +76,9 @@ def main() -> None:
                         help="Generate thesis-ready figures (PDF + PNG) after evaluation")
     parser.add_argument("--figures-dir", default="figures",
                         help="Directory to save figures in (default: figures/)")
+    parser.add_argument("--ragas-workers", type=int, default=4,
+                        help="Concurrent RAGAS judge calls; set equal to Ollama's "
+                             "OLLAMA_NUM_PARALLEL (default: 4)")
     parser.add_argument("--output", metavar="FILE",
                         help="Save full results to a JSON file")
     args = parser.parse_args()
@@ -168,7 +171,7 @@ def main() -> None:
         ragas_scores: dict = {}
         if args.with_ragas:
             print(f"  Running RAGAS for seed {seed_idx + 1} (this may take several minutes)...")
-            ragas_scores = _run_ragas(ragas_rows)
+            ragas_scores = _run_ragas(ragas_rows, ragas_workers=args.ragas_workers)
 
         per_seed_summaries.append(_build_summary(records, args.with_generation, ragas_scores))
 
@@ -253,7 +256,7 @@ def _ragas_from_file(args) -> None:
                     })
 
         print(f"Running RAGAS for seed {seed_idx + 1}/{len(seeds)} (seed={seed})...")
-        ragas_scores = _run_ragas(ragas_rows)
+        ragas_scores = _run_ragas(ragas_rows, ragas_workers=args.ragas_workers)
 
         updated = dict(summary)
         for name in ("naive", "advanced"):
@@ -335,7 +338,8 @@ def _aggregate_summaries(summaries: list[dict]) -> dict:
 # RAGAS evaluation                                                             #
 # --------------------------------------------------------------------------- #
 
-def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b") -> dict:
+def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b",
+               ragas_workers: int = 4) -> dict:
     try:
         from ragas import EvaluationDataset, SingleTurnSample, evaluate
         from ragas.llms import LangchainLLMWrapper
@@ -381,12 +385,15 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b") -> dict:
         ]
         dataset = EvaluationDataset(samples=samples)
         from ragas import RunConfig
+        # max_workers must match Ollama's OLLAMA_NUM_PARALLEL: more workers than
+        # Ollama can serve concurrently just makes the surplus queue past the
+        # per-job timeout. A generous timeout covers a full slow generation.
         result = evaluate(
             dataset=dataset,
             metrics=[Faithfulness(), ResponseRelevancy()],
             llm=llm,
             embeddings=embeddings,
-            run_config=RunConfig(max_workers=1, timeout=300),
+            run_config=RunConfig(max_workers=ragas_workers, timeout=600),
         )
         df = result.to_pandas()
         faith_vals = [v for v in df["faithfulness"] if not math.isnan(v)]
