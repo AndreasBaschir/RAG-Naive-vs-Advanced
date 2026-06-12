@@ -1,7 +1,7 @@
 chromadb==1.5.9
 datasets==4.8.5
 ollama==0.6.2
-rank_bm25==0.2.2
+bm25s>=0.3.0
 sentence_transformers==5.5.1
 streamlit==1.57.0
 ragas>=0.2.0,<0.3.0
