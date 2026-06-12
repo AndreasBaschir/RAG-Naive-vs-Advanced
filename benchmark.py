@@ -380,11 +380,13 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b") -> dict:
             for r in usable
         ]
         dataset = EvaluationDataset(samples=samples)
+        from ragas import RunConfig
         result = evaluate(
             dataset=dataset,
             metrics=[Faithfulness(), ResponseRelevancy()],
             llm=llm,
             embeddings=embeddings,
+            run_config=RunConfig(max_workers=1, timeout=300),
         )
         df = result.to_pandas()
         faith_vals = [v for v in df["faithfulness"] if not math.isnan(v)]
