@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pathlib
 
+import bm25s
 import chromadb
 import torch
-from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 ROOT = pathlib.Path(__file__).parent.parent
@@ -24,7 +24,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _embedder: SentenceTransformer | None = None
 _collection: chromadb.Collection | None = None
 _reranker: CrossEncoder | None = None
-_bm25_index: BM25Okapi | None = None
+_bm25_index: bm25s.BM25 | None = None
 _bm25_corpus: list[dict] | None = None
 
 
@@ -67,19 +67,17 @@ def dense_retrieve_vec(vec: list[float], n: int = 20) -> list[dict]:
 def bm25_retrieve(query: str, n: int = 20) -> list[dict]:
     """Top-n chunks via BM25 keyword scoring over the full corpus."""
     index, corpus = _get_bm25()
-    tokenized_query = query.lower().split()
-    scores = index.get_scores(tokenized_query)
-
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n]
+    query_tokens = bm25s.tokenize([query])
+    results, scores = index.retrieve(query_tokens, k=min(n, len(corpus)))
 
     return [
         {
-            "text": corpus[i]["text"],
-            "source": corpus[i]["title"],
-            "bm25_score": round(float(scores[i]), 4),
+            "text": corpus[idx]["text"],
+            "source": corpus[idx]["title"],
+            "bm25_score": round(float(score), 4),
         }
-        for i in top_indices
-        if scores[i] > 0
+        for idx, score in zip(results[0], scores[0])
+        if score > 0
     ]
 
 
@@ -154,14 +152,21 @@ def _get_reranker() -> CrossEncoder:
     return _reranker
 
 
+_BM25_CACHE_PATH = ROOT / "data" / "bm25_index.pkl"
+
+
 def _get_bm25() -> tuple[BM25Okapi, list[dict]]:
     global _bm25_index, _bm25_corpus
     if _bm25_index is not None and _bm25_corpus is not None:
         return _bm25_index, _bm25_corpus
 
+    if _BM25_CACHE_PATH.exists():
+        import pickle
+        with open(_BM25_CACHE_PATH, "rb") as f:
+            _bm25_index, _bm25_corpus = pickle.load(f)
+        return _bm25_index, _bm25_corpus
+
     col = _get_collection()
-    # Load full corpus from ChromaDB to build the BM25 index.
-    # One-time cost at first query; cached for the process lifetime.
     all_docs = col.get(include=["documents", "metadatas"])
 
     _bm25_corpus = [
@@ -169,6 +174,13 @@ def _get_bm25() -> tuple[BM25Okapi, list[dict]]:
         for text, meta in zip(all_docs["documents"], all_docs["metadatas"])
     ]
 
-    tokenized = [doc["text"].lower().split() for doc in _bm25_corpus]
-    _bm25_index = BM25Okapi(tokenized)
+    corpus_tokens = bm25s.tokenize([doc["text"] for doc in _bm25_corpus])
+    _bm25_index = bm25s.BM25()
+    _bm25_index.index(corpus_tokens)
+
+    import pickle
+    _BM25_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_BM25_CACHE_PATH, "wb") as f:
+        pickle.dump((_bm25_index, _bm25_corpus), f)
+
     return _bm25_index, _bm25_corpus
