@@ -125,6 +125,19 @@ python benchmark.py --dataset docred --samples 150 --num-seeds 4 --with-generati
 Add `--with-ragas` for RAGAS faithfulness / answer-relevancy (slow). Results are
 reported as mean ± std across seeds with paired significance tests.
 
+**Hallucination resistance (DocRED).** `--neg-frac F` turns a fraction `F` of
+questions into *unanswerable* ones — a real entity paired with a relation it does
+not have in the document — and reports each pipeline's **hallucination rate**
+(fraction where it fabricated an answer instead of abstaining). Requires
+`--with-generation`. Each DocRED record also stores its `relation`,
+`relation_id`, `evidence_sents` and `multi_hop` flag, so per-relation-type and
+multi-hop breakdowns can be computed post-hoc from the saved `records`.
+
+```bash
+python benchmark.py --dataset docred --samples 100 --num-seeds 3 \
+    --with-ragas --neg-frac 0.3 --plot --output results_docred.json
+```
+
 ## Interface
 
 ```bash
