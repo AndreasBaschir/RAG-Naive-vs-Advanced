@@ -163,12 +163,18 @@ def _get_bm25() -> tuple[bm25s.BM25, list[dict]]:
     if _bm25_index is not None and _bm25_corpus is not None and _bm25_key == active_key():
         return _bm25_index, _bm25_corpus
 
-    import pickle
-    cache_path = active().bm25_cache_path
+    import json
 
-    if cache_path.exists():
-        with open(cache_path, "rb") as f:
-            _bm25_index, _bm25_corpus = pickle.load(f)
+    # Use bm25s' native save/load (NOT pickle) — pickled BM25 objects lose the
+    # `scores` index across library versions/machines. The doc corpus (text +
+    # title) is stored alongside as JSON.
+    cache_dir = active().bm25_cache_dir
+    corpus_file = cache_dir / "corpus.json"
+
+    if cache_dir.exists() and corpus_file.exists():
+        _bm25_index = bm25s.BM25.load(str(cache_dir), mmap=False)
+        with open(corpus_file) as f:
+            _bm25_corpus = json.load(f)
         _bm25_key = active_key()
         return _bm25_index, _bm25_corpus
 
@@ -184,9 +190,10 @@ def _get_bm25() -> tuple[bm25s.BM25, list[dict]]:
     _bm25_index = bm25s.BM25()
     _bm25_index.index(corpus_tokens)
 
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_path, "wb") as f:
-        pickle.dump((_bm25_index, _bm25_corpus), f)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _bm25_index.save(str(cache_dir))
+    with open(corpus_file, "w") as f:
+        json.dump(_bm25_corpus, f)
 
     _bm25_key = active_key()
     return _bm25_index, _bm25_corpus

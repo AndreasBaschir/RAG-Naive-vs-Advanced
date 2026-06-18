@@ -31,7 +31,7 @@ CHROMA_PATH = DATA_DIR / "chroma"
 class DatasetSpec:
     key: str
     collection_name: str
-    bm25_cache_path: pathlib.Path
+    bm25_cache_dir: pathlib.Path
     load_corpus: Callable[[], list[dict]]       # -> [{"text", "title"}] for ingestion
     load_eval_rows: Callable[[], list[dict]]    # raw rows for benchmark sampling
     make_record: Callable[[dict], dict | None]  # row -> benchmark record (None to skip)
@@ -371,7 +371,7 @@ def _docred_negative_record(row: dict) -> dict | None:
 register(DatasetSpec(
     key="squad",
     collection_name="squad",
-    bm25_cache_path=DATA_DIR / "bm25_index_squad.pkl",
+    bm25_cache_dir=DATA_DIR / "bm25_squad",
     load_corpus=_squad_corpus,
     load_eval_rows=_squad_eval_rows,
     make_record=_squad_record,
@@ -380,7 +380,7 @@ register(DatasetSpec(
 register(DatasetSpec(
     key="docred",
     collection_name="docred",
-    bm25_cache_path=DATA_DIR / "bm25_index_docred.pkl",
+    bm25_cache_dir=DATA_DIR / "bm25_docred",
     load_corpus=_docred_corpus,
     load_eval_rows=_docred_eval_rows,
     make_record=_docred_record,
