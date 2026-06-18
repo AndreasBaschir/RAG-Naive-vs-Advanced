@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import zlib
 from dataclasses import dataclass
 from typing import Any, Callable, cast
 
@@ -34,6 +35,8 @@ class DatasetSpec:
     load_corpus: Callable[[], list[dict]]       # -> [{"text", "title"}] for ingestion
     load_eval_rows: Callable[[], list[dict]]    # raw rows for benchmark sampling
     make_record: Callable[[dict], dict | None]  # row -> benchmark record (None to skip)
+    # Optional: row -> unanswerable record for the hallucination/abstention test.
+    make_negative_record: Callable[[dict], dict | None] | None = None
 
 
 _REGISTRY: dict[str, DatasetSpec] = {}
@@ -283,11 +286,81 @@ def _docred_record(row: dict) -> dict | None:
 
     head_name = head_names[0]
     relation = lab["relation_text"]
+    evidence = lab.get("evidence", [])
     return {
         "question": f'What is the "{relation}" of {head_name}?',
         "gold_context": _docred_doc_text(row),
         "gold_answers": tail_names,
         "gold_title": row["title"],
+        # relation-extraction metadata for post-hoc breakdowns
+        "answerable": True,
+        "relation": relation,
+        "relation_id": lab["relation_id"],
+        "evidence_sents": len(evidence),
+        "multi_hop": len(evidence) > 1,
+    }
+
+
+_docred_relations_cache: list[str] | None = None
+
+
+def _docred_relations() -> list[str]:
+    """Sorted vocabulary of all relation_text values across DocRED."""
+    global _docred_relations_cache
+    if _docred_relations_cache is None:
+        vocab: set[str] = set()
+        for row in _load_docred():
+            for lab in row["labels"]:
+                if lab["relation_text"]:
+                    vocab.add(lab["relation_text"])
+        _docred_relations_cache = sorted(vocab)
+    return _docred_relations_cache
+
+
+def _docred_negative_record(row: dict) -> dict | None:
+    """Build an UNANSWERABLE question: a real head entity paired with a relation
+    it does NOT have in this document. Correct behaviour is to abstain, so these
+    measure each pipeline's hallucination resistance.
+
+    Caveat: DocRED annotations are not exhaustive, so a 'negative' relation may
+    occasionally hold in reality (a known DocRED limitation) — treated as noise.
+    """
+    labels = row["labels"]
+    vertex = row["vertexSet"]
+    if not labels or len(vertex) == 0:
+        return None
+
+    candidates = [
+        lab for lab in labels
+        if lab["head"] != lab["tail"]
+        and 0 <= lab["head"] < len(vertex)
+        and 0 <= lab["tail"] < len(vertex)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda l: (not l["evidence"], l["relation_id"], l["head"], l["tail"]))
+    lab = candidates[0]
+
+    head_names = _entity_names(vertex[lab["head"]])
+    if not head_names:
+        return None
+    head_name = head_names[0]
+
+    # Relations this head actually has in the document — exclude them.
+    held = {l["relation_text"] for l in labels if l["head"] == lab["head"]}
+    vocab = [r for r in _docred_relations() if r not in held]
+    if not vocab:
+        return None
+
+    # Stable, reproducible pick (independent of PYTHONHASHSEED).
+    neg_relation = vocab[zlib.crc32(f"{row['title']}|{head_name}".encode()) % len(vocab)]
+    return {
+        "question": f'What is the "{neg_relation}" of {head_name}?',
+        "gold_context": _docred_doc_text(row),
+        "gold_answers": [],
+        "gold_title": row["title"],
+        "answerable": False,
+        "relation": neg_relation,
     }
 
 
@@ -311,4 +384,5 @@ register(DatasetSpec(
     load_corpus=_docred_corpus,
     load_eval_rows=_docred_eval_rows,
     make_record=_docred_record,
+    make_negative_record=_docred_negative_record,
 ))
