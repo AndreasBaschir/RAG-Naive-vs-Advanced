@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Generator
 
 import chromadb
@@ -12,7 +13,9 @@ from datasets_registry import CHROMA_PATH, active, active_key
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TOP_K = 5
 LLM_MODEL = "qwen3:8b"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Force with RAG_DEVICE=cpu (e.g. to leave the GPU entirely to Ollama);
+# otherwise auto-detect CUDA.
+DEVICE = os.environ.get("RAG_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 
 _SYSTEM_PROMPT = (
     "You are a precise, factual assistant. "
