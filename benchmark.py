@@ -37,11 +37,11 @@ import os
 import random
 import statistics
 import string
+import sys
 import time
 from collections import Counter
 
-from datasets import load_dataset
-
+import datasets_registry
 from advanced import pipeline as adv
 from naive import pipeline as naive
 
@@ -79,12 +79,20 @@ def main() -> None:
     parser.add_argument("--ragas-workers", type=int, default=4,
                         help="Concurrent RAGAS judge calls; set equal to Ollama's "
                              "OLLAMA_NUM_PARALLEL (default: 4)")
+    parser.add_argument("--dataset", choices=datasets_registry.available(),
+                        default="squad",
+                        help="Which dataset to benchmark (default: squad)")
     parser.add_argument("--output", metavar="FILE",
                         help="Save full results to a JSON file")
     args = parser.parse_args()
 
     if args.with_ragas:
         args.with_generation = True
+
+    # Select the active dataset BEFORE any pipeline call so the lazy singletons
+    # resolve the right ChromaDB collection / BM25 cache.
+    datasets_registry.set_active(args.dataset)
+    spec = datasets_registry.active()
 
     if args.ragas_from:
         _ragas_from_file(args)
@@ -93,13 +101,17 @@ def main() -> None:
     # Derive reproducible seeds from the base seed
     seeds = [args.seed + i * 1000 for i in range(args.num_seeds)]
 
-    print("Loading SQuAD training split...")
-    dataset = load_dataset("rajpurkar/squad", split="train")
-    rows = list(dataset)
+    print(f"Loading '{args.dataset}' evaluation rows...")
+    rows = spec.load_eval_rows()
 
     print("Warming up pipelines (loads models + BM25 index)...")
     naive.retrieve("warm-up query")
     adv.retrieve("warm-up query")
+
+    if naive._get_collection().count() == 0:
+        print(f"\nCollection '{spec.collection_name}' is empty. "
+              f"Run: python ingest.py --dataset {args.dataset}")
+        sys.exit(1)
     print("Ready.\n")
 
     pipelines = [("naive", naive), ("advanced", adv)]
@@ -110,23 +122,26 @@ def main() -> None:
         print(f"--- Seed {seed_idx + 1}/{len(seeds)}  (seed={seed}, {args.samples} questions) ---")
 
         rng = random.Random(seed)
-        sample = rng.sample(rows, min(args.samples, len(rows)))
+        # Oversample the candidate pool, then keep the first N rows that yield a
+        # usable record (make_record may return None, e.g. a DocRED doc with no
+        # usable triple), so each seed still produces args.samples questions.
+        pool = rng.sample(rows, min(args.samples * 2, len(rows)))
+        sample: list[dict] = []
+        for row in pool:
+            record = spec.make_record(row)
+            if record is not None:
+                record["seed"] = seed
+                sample.append(record)
+            if len(sample) >= args.samples:
+                break
 
         records: list[dict] = []
         ragas_rows: dict[str, list[dict]] = {"naive": [], "advanced": []}
 
-        for i, row in enumerate(sample):
-            question: str = row["question"]
-            gold_answers: list[str] = row["answers"]["text"]
-            gold_title: str = row["title"]
-
-            record: dict = {
-                "question": question,
-                "gold_context": row["context"],
-                "gold_answers": gold_answers,
-                "gold_title": gold_title,
-                "seed": seed,
-            }
+        for i, record in enumerate(sample):
+            question: str = record["question"]
+            gold_answers: list[str] = record["gold_answers"]
+            gold_title: str = record["gold_title"]
 
             for name, pipeline in pipelines:
                 t0 = time.perf_counter()
@@ -195,6 +210,7 @@ def main() -> None:
     if args.output:
         with open(args.output, "w") as fh:
             json.dump({
+                "dataset": args.dataset,
                 "summary": final_summary,
                 "per_seed_summaries": per_seed_summaries,
                 "significance": sig_tests,
@@ -205,7 +221,7 @@ def main() -> None:
 
     if args.plot:
         _plot_results(final_summary, has_generation, has_ragas,
-                      args.figures_dir, multi_seed, len(seeds))
+                      args.figures_dir, multi_seed, len(seeds), args.dataset)
 
 
 # --------------------------------------------------------------------------- #
@@ -296,7 +312,8 @@ def _ragas_from_file(args) -> None:
 
     if args.plot:
         _plot_results(final_summary, has_generation, has_ragas,
-                      args.figures_dir, multi_seed, len(seeds))
+                      args.figures_dir, multi_seed, len(seeds),
+                      data.get("dataset", args.dataset))
 
 
 def _write_checkpoint(path: str, per_seed_summaries: list[dict],
@@ -424,7 +441,8 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b",
 # --------------------------------------------------------------------------- #
 
 def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
-                  out_dir: str, multi_seed: bool, num_seeds: int = DEFAULT_NUM_SEEDS) -> None:
+                  out_dir: str, multi_seed: bool, num_seeds: int = DEFAULT_NUM_SEEDS,
+                  dataset: str = "squad") -> None:
     try:
         import matplotlib.pyplot as plt
         import matplotlib.ticker as mticker
@@ -455,15 +473,19 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
 
     n = summary["naive"]
     a = summary["advanced"]
+    ds_label = dataset.upper()  # e.g. "SQUAD", "DOCRED" — appended to titles
 
     def _get(d: dict, key: str) -> tuple[float, float]:
         """Return (mean, std) for a metric. std=0 when no multi-seed."""
         return d[key], d.get(f"{key}_std", 0.0)
 
     def _save(fig: "plt.Figure", name: str) -> None:
+        # Prefix filenames with the dataset so SQuAD/DocRED runs into the same
+        # figures dir don't overwrite each other.
+        fname = f"{dataset}_{name}"
         for ext in ("pdf", "png"):
-            fig.savefig(os.path.join(out_dir, f"{name}.{ext}"), dpi=300, bbox_inches="tight")
-        print(f"  Saved {name}.pdf / {name}.png")
+            fig.savefig(os.path.join(out_dir, f"{fname}.{ext}"), dpi=300, bbox_inches="tight")
+        print(f"  Saved {fname}.pdf / {fname}.png")
         plt.close(fig)
 
     def _grouped_bars(ax, labels, naive_vals, adv_vals,
@@ -502,7 +524,7 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
     ax.set_ylim(0, 1.2)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
     ax.set_ylabel("Scor")
-    ax.set_title("Metrici de Regăsire")
+    ax.set_title(f"Metrici de Regăsire — {ds_label}")
     if multi_seed:
         ax.set_xlabel(f"medie ± std  ({num_seeds} seed-uri)")
     fig.tight_layout()
@@ -527,7 +549,7 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
                 val + max_top * 0.02,
                 f"{val:.1f} ms", ha="center", va="bottom", fontsize=FONT_SIZE - 1)
     ax.set_ylabel("Latență medie (ms)")
-    ax.set_title("Latența Medie de Procesare a Interogării")
+    ax.set_title(f"Latența Medie de Procesare a Interogării — {ds_label}")
     ax.set_ylim(0, max_top * 1.25)
     fig.tight_layout()
     _save(fig, "latency")
@@ -548,7 +570,7 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
         ax.set_ylim(0, 1.2)
         ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
         ax.set_ylabel("Scor")
-        ax.set_title("Calitatea Răspunsurilor")
+        ax.set_title(f"Calitatea Răspunsurilor — {ds_label}")
         if multi_seed:
             ax.set_xlabel(f"medie ± std  ({num_seeds} seed-uri)")
         fig.tight_layout()
@@ -570,7 +592,7 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
         ax.set_ylim(0, 1.2)
         ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
         ax.set_ylabel("Scor RAGAS")
-        ax.set_title("Metrici RAGAS")
+        ax.set_title(f"Metrici RAGAS — {ds_label}")
         if multi_seed:
             ax.set_xlabel(f"medie ± std  ({num_seeds} seed-uri)")
         fig.tight_layout()
@@ -610,7 +632,7 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
     ax.fill(angles, adv_radar,   color=ADV_COLOR,   alpha=0.15)
     ax.set_thetagrids([a * 180 / math.pi for a in angles[:-1]], metric_names)
     ax.set_ylim(0, 1)
-    ax.set_title("Prezentare Generală a Metricilor", pad=20)
+    ax.set_title(f"Prezentare Generală a Metricilor — {ds_label}", pad=20)
     ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1))
     fig.tight_layout()
     _save(fig, "overview_radar")

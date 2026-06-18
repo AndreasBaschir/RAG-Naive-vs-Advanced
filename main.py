@@ -3,23 +3,29 @@ from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 
+import datasets_registry
 from advanced import pipeline as adv
 from advanced.retrieval import _get_bm25, _get_embedder as _adv_embedder, _get_reranker
 from naive import pipeline as naive
 
 
 @st.cache_resource
-def _warmup():
+def _warmup(dataset: str):
+    # `dataset` keys the cache so switching datasets rebuilds the singletons
+    # against the newly-selected ChromaDB collection / BM25 index.
+    datasets_registry.set_active(dataset)
     naive._get_embedder()
     _adv_embedder()
     _get_reranker()
     _get_bm25()
 
 
-_warmup()
-
 st.set_page_config(layout="wide", page_title="Naive vs Advanced RAG")
 st.title("Naive vs Advanced RAG")
+
+dataset = st.sidebar.selectbox("Dataset", datasets_registry.available())
+datasets_registry.set_active(dataset)
+_warmup(dataset)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []

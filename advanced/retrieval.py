@@ -6,16 +6,12 @@ Dense (ChromaDB cosine similarity) + Sparse (BM25) + RRF + Cross-encoder reranki
 
 from __future__ import annotations
 
-import pathlib
-
 import bm25s
 import chromadb
 import torch
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
-ROOT = pathlib.Path(__file__).parent.parent
-CHROMA_PATH = ROOT / "data" / "chroma"
-COLLECTION_NAME = "squad"
+from datasets_registry import CHROMA_PATH, active, active_key
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -23,9 +19,11 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 _embedder: SentenceTransformer | None = None
 _collection: chromadb.Collection | None = None
+_collection_key: str | None = None
 _reranker: CrossEncoder | None = None
 _bm25_index: bm25s.BM25 | None = None
 _bm25_corpus: list[dict] | None = None
+_bm25_key: str | None = None
 
 
 def encode(texts: list[str]) -> list[list[float]]:
@@ -133,15 +131,19 @@ def _get_embedder() -> SentenceTransformer:
 
 
 def _get_collection() -> chromadb.Collection:
-    global _collection
-    if _collection is not None:
+    global _collection, _collection_key, _bm25_index, _bm25_corpus
+    if _collection is not None and _collection_key == active_key():
         return _collection
+    # Dataset switched (or first call): drop any stale BM25 state too.
+    _bm25_index = None
+    _bm25_corpus = None
     CHROMA_PATH.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(CHROMA_PATH))
     _collection = client.get_or_create_collection(
-        COLLECTION_NAME,
+        active().collection_name,
         metadata={"hnsw:space": "cosine"},
     )
+    _collection_key = active_key()
     return _collection
 
 
@@ -152,18 +154,18 @@ def _get_reranker() -> CrossEncoder:
     return _reranker
 
 
-_BM25_CACHE_PATH = ROOT / "data" / "bm25_index.pkl"
-
-
-def _get_bm25() -> tuple[BM25Okapi, list[dict]]:
-    global _bm25_index, _bm25_corpus
-    if _bm25_index is not None and _bm25_corpus is not None:
+def _get_bm25() -> tuple[bm25s.BM25, list[dict]]:
+    global _bm25_index, _bm25_corpus, _bm25_key
+    if _bm25_index is not None and _bm25_corpus is not None and _bm25_key == active_key():
         return _bm25_index, _bm25_corpus
 
-    if _BM25_CACHE_PATH.exists():
-        import pickle
-        with open(_BM25_CACHE_PATH, "rb") as f:
+    import pickle
+    cache_path = active().bm25_cache_path
+
+    if cache_path.exists():
+        with open(cache_path, "rb") as f:
             _bm25_index, _bm25_corpus = pickle.load(f)
+        _bm25_key = active_key()
         return _bm25_index, _bm25_corpus
 
     col = _get_collection()
@@ -178,9 +180,9 @@ def _get_bm25() -> tuple[BM25Okapi, list[dict]]:
     _bm25_index = bm25s.BM25()
     _bm25_index.index(corpus_tokens)
 
-    import pickle
-    _BM25_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_BM25_CACHE_PATH, "wb") as f:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "wb") as f:
         pickle.dump((_bm25_index, _bm25_corpus), f)
 
+    _bm25_key = active_key()
     return _bm25_index, _bm25_corpus

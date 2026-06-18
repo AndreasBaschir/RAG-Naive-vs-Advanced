@@ -1,44 +1,34 @@
 """
-Ingest SQuAD contexts into ChromaDB.
+Ingest a dataset's corpus into ChromaDB.
 
-Ambele pipeline-uri (naive și advanced) citesc din aceeași colecție.
+Ambele pipeline-uri (naive și advanced) citesc din aceeași colecție per dataset.
 Diferența dintre ele stă în arhitectura de retrieval, nu în date.
 
-Run once:
-    python ingest.py
+Run once per dataset:
+    python ingest.py                  # squad (default)
+    python ingest.py --dataset docred
 """
 
 from __future__ import annotations
 
-import pathlib
-from typing import Any, cast
+import argparse
 
 import chromadb
-from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
 
-ROOT = pathlib.Path(__file__).parent
-CHROMA_PATH = ROOT / "data" / "chroma"
-COLLECTION_NAME = "squad"
+from datasets_registry import CHROMA_PATH, active, available, set_active
+
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 BATCH_SIZE = 256
 
 
-def ingest() -> None:
-    print("Loading SQuAD dataset...")
-    dataset = load_dataset("rajpurkar/squad", split="train")
+def ingest(dataset: str) -> None:
+    set_active(dataset)
+    spec = active()
 
-    # Deduplicate: același paragraf apare de mai multe ori (câte o întrebare per rând)
-    seen: set[str] = set()
-    contexts: list[dict] = []
-    for _row in dataset:
-        row = cast(dict[str, Any], _row)
-        ctx = row["context"]
-        if ctx not in seen:
-            seen.add(ctx)
-            contexts.append({"text": ctx, "title": row["title"]})
-
-    print(f"Found {len(contexts)} unique contexts.")
+    print(f"Loading '{dataset}' corpus...")
+    contexts = spec.load_corpus()
+    print(f"Found {len(contexts)} unique documents.")
 
     print("Loading embedding model...")
     embedder = SentenceTransformer(EMBEDDING_MODEL)
@@ -47,12 +37,13 @@ def ingest() -> None:
     CHROMA_PATH.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(CHROMA_PATH))
     collection = client.get_or_create_collection(
-        COLLECTION_NAME,
+        spec.collection_name,
         metadata={"hnsw:space": "cosine"},
     )
 
     if collection.count() > 0:
-        print(f"Collection already contains {collection.count()} documents. Skipping.")
+        print(f"Collection '{spec.collection_name}' already contains "
+              f"{collection.count()} documents. Skipping.")
         return
 
     print("Embedding and ingesting...")
@@ -69,8 +60,13 @@ def ingest() -> None:
         )
         print(f"  {i + len(batch)}/{len(contexts)}")
 
-    print(f"Done. {collection.count()} documents stored in ChromaDB.")
+    print(f"Done. {collection.count()} documents stored in collection "
+          f"'{spec.collection_name}'.")
 
 
 if __name__ == "__main__":
-    ingest()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", choices=available(), default="squad",
+                        help="Which dataset's corpus to ingest (default: squad)")
+    args = parser.parse_args()
+    ingest(args.dataset)

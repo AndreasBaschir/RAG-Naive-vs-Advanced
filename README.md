@@ -90,14 +90,40 @@ pip install -r requirements.txt
 python ingest.py
 ```
 
-### Dataset
+### Datasets
 
-To ingest data, run:
+Two datasets are supported, each stored in its own ChromaDB collection:
+
+- **SQuAD** (`squad`) — extractive question answering.
+- **DocRED** (`docred`) — document-level **relation extraction**. Each relation
+  triple `(head, relation, tail)` is turned into a question
+  (`What is the "{relation}" of {head}?`) whose gold answers are the tail
+  entity's surface forms. One triple per document is evaluated.
+
+Ingest a dataset (run once per dataset):
 ```bash
-python ingest.py
+python ingest.py                  # squad (default)
+python ingest.py --dataset docred
 ```
 
-This populates ChromaDB with the SQuAD dataset.
+Notes:
+- The first advanced run per dataset builds a BM25 index cached at
+  `data/bm25_index_<dataset>.pkl`. An older `data/bm25_index.pkl` from a previous
+  version is now orphaned and can be deleted (it regenerates).
+- Documents are embedded whole; passages longer than the embedder's ~256-token
+  window are truncated at embed time. This affects both pipelines equally, so the
+  Naive-vs-Advanced comparison stays fair, but interpret absolute recall with it
+  in mind.
+
+## Benchmark
+
+```bash
+python benchmark.py --dataset squad  --samples 150 --num-seeds 4 --with-generation --plot --output results_squad.json
+python benchmark.py --dataset docred --samples 150 --num-seeds 4 --with-generation --plot --output results_docred.json
+```
+
+Add `--with-ragas` for RAGAS faithfulness / answer-relevancy (slow). Results are
+reported as mean ± std across seeds with paired significance tests.
 
 ## Interface
 
@@ -105,7 +131,8 @@ This populates ChromaDB with the SQuAD dataset.
 streamlit run main.py
 ```
 
-The visualization compares responses and metrics from both systems side-by-side.
+Compares responses from both systems side-by-side. Use the sidebar to switch
+between the `squad` and `docred` corpora.
 
 ## Project Structure
 
@@ -139,7 +166,7 @@ RAG-Naive-vs-Advanced/
 - `chromadb` - Vector database
 - `ollama` - LLM client
 - `ragas` - Evaluation metrics
-- `rank_bm25` - BM25 indexing
+- `bm25s` - BM25 indexing
 
 ---
 

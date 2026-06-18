@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pathlib
 from typing import Generator
 
 import chromadb
@@ -8,9 +7,7 @@ import ollama
 import torch
 from sentence_transformers import SentenceTransformer
 
-ROOT = pathlib.Path(__file__).parent.parent
-CHROMA_PATH = ROOT / "data" / "chroma"
-COLLECTION_NAME = "squad"
+from datasets_registry import CHROMA_PATH, active, active_key
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TOP_K = 5
@@ -26,6 +23,7 @@ _SYSTEM_PROMPT = (
 
 _embedder: SentenceTransformer | None = None
 _collection: chromadb.Collection | None = None
+_collection_key: str | None = None
 
 
 def retrieve(query: str) -> list[dict]:
@@ -86,13 +84,14 @@ def _get_embedder() -> SentenceTransformer:
 
 
 def _get_collection() -> chromadb.Collection:
-    global _collection
-    if _collection is not None:
+    global _collection, _collection_key
+    if _collection is not None and _collection_key == active_key():
         return _collection
     CHROMA_PATH.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(CHROMA_PATH))
     _collection = client.get_or_create_collection(
-        COLLECTION_NAME,
+        active().collection_name,
         metadata={"hnsw:space": "cosine"},
     )
+    _collection_key = active_key()
     return _collection
