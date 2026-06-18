@@ -82,6 +82,11 @@ def main() -> None:
     parser.add_argument("--dataset", choices=datasets_registry.available(),
                         default="squad",
                         help="Which dataset to benchmark (default: squad)")
+    parser.add_argument("--neg-frac", type=float, default=0.0,
+                        help="Fraction of questions made UNANSWERABLE (a real entity "
+                             "paired with a relation it lacks) to measure hallucination "
+                             "resistance. Needs --with-generation and a dataset that "
+                             "supports negatives (docred). Default: 0.0")
     parser.add_argument("--output", metavar="FILE",
                         help="Save full results to a JSON file")
     args = parser.parse_args()
@@ -125,10 +130,15 @@ def main() -> None:
         # Oversample the candidate pool, then keep the first N rows that yield a
         # usable record (make_record may return None, e.g. a DocRED doc with no
         # usable triple), so each seed still produces args.samples questions.
+        # A neg_frac fraction is turned into UNANSWERABLE questions to measure
+        # hallucination resistance (only when generation runs and the dataset
+        # provides a negative maker).
+        make_neg = spec.make_negative_record if args.with_generation else None
         pool = rng.sample(rows, min(args.samples * 2, len(rows)))
         sample: list[dict] = []
         for row in pool:
-            record = spec.make_record(row)
+            use_neg = make_neg is not None and args.neg_frac > 0 and rng.random() < args.neg_frac
+            record = make_neg(row) if use_neg else spec.make_record(row)
             if record is not None:
                 record["seed"] = seed
                 sample.append(record)
@@ -163,17 +173,21 @@ def main() -> None:
                     except Exception as exc:
                         answer = f"[ERROR: {exc}]"
                     entry["answer"] = answer
-                    entry["f1"] = round(
-                        max((_token_f1(answer, ref) for ref in gold_answers), default=0.0), 4
-                    )
-                    entry["em"] = any(_exact_match(answer, ref) for ref in gold_answers)
+                    entry["abstained"] = REFUSAL_MARKER in answer.lower()
 
-                    if args.with_ragas:
-                        ragas_rows[name].append({
-                            "question": question,
-                            "answer": answer,
-                            "contexts": [c["text"] for c in chunks],
-                        })
+                    if record.get("answerable", True):
+                        entry["f1"] = round(
+                            max((_token_f1(answer, ref) for ref in gold_answers), default=0.0), 4
+                        )
+                        entry["em"] = any(_exact_match(answer, ref) for ref in gold_answers)
+
+                        # Only answerable questions are scored by RAGAS.
+                        if args.with_ragas:
+                            ragas_rows[name].append({
+                                "question": question,
+                                "answer": answer,
+                                "contexts": [c["text"] for c in chunks],
+                            })
 
                 record[name] = entry
 
@@ -245,22 +259,13 @@ def _ragas_from_file(args) -> None:
     updated_summaries = []
     for seed_idx, (seed, summary) in enumerate(zip(seeds, per_seed_summaries)):
         records = records_by_seed.get(seed, [])
+        # Retrieved chunk texts aren't stored in the JSON, so RAGAS faithfulness
+        # is judged against the gold context. Unanswerable (negative) records are
+        # excluded — they have no gold answer to be faithful to.
         ragas_rows: dict[str, list[dict]] = {"naive": [], "advanced": []}
         for r in records:
-            for name in ("naive", "advanced"):
-                entry = r.get(name, {})
-                answer = entry.get("answer", "")
-                if answer:
-                    ragas_rows[name].append({
-                        "question": r["question"],
-                        "answer": answer,
-                        "contexts": [c["text"] for c in []] ,  # contexts not stored — use gold
-                    })
-
-        # contexts aren't stored in the JSON — rebuild from the record's gold_context
-        for name in ("naive", "advanced"):
-            ragas_rows[name] = []
-        for r in records:
+            if not r.get("answerable", True):
+                continue
             for name in ("naive", "advanced"):
                 entry = r.get(name, {})
                 answer = entry.get("answer", "")
@@ -599,6 +604,28 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
         _save(fig, "ragas_metrics")
 
     # ------------------------------------------------------------------ #
+    # Figure 4b — Hallucination rate on unanswerable questions            #
+    # ------------------------------------------------------------------ #
+    if "hallucination_rate" in n:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        n_h, n_h_std = _get(n, "hallucination_rate")
+        a_h, a_h_std = _get(a, "hallucination_rate")
+        errs = [n_h_std, a_h_std] if multi_seed else None
+        bars = ax.bar(["Naive RAG", "Advanced RAG"], [n_h, a_h],
+                      color=[NAIVE_COLOR, ADV_COLOR], width=0.4, zorder=3,
+                      yerr=errs, capsize=5 if multi_seed else 0,
+                      error_kw={"elinewidth": 1.2})
+        for bar, val in zip(bars, [n_h, a_h]):
+            ax.text(bar.get_x() + bar.get_width() / 2, val + 0.02,
+                    f"{val:.3f}", ha="center", va="bottom", fontsize=FONT_SIZE - 1)
+        ax.set_ylim(0, 1.1)
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
+        ax.set_ylabel("Rată de halucinație (mai mic = mai bine)")
+        ax.set_title(f"Halucinație la Întrebări fără Răspuns — {ds_label}")
+        fig.tight_layout()
+        _save(fig, "hallucination")
+
+    # ------------------------------------------------------------------ #
     # Figure 5 — Radar overview                                           #
     # ------------------------------------------------------------------ #
     metric_names: list[str] = ["Context\nRecall@K", "MRR"]
@@ -700,18 +727,30 @@ def _sample_std(values: list) -> float:
 
 
 def _build_summary(records: list[dict], with_generation: bool, ragas_scores: dict) -> dict:
+    # Retrieval/answer-quality metrics are computed over answerable questions
+    # only; the hallucination metric is computed over the unanswerable ones.
+    answerable = [r for r in records if r.get("answerable", True)]
+    negatives = [r for r in records if not r.get("answerable", True)]
+
     summary = {}
     for name in ("naive", "advanced"):
         entries = [r[name] for r in records]
+        ans = [r[name] for r in answerable]
         s: dict = {
             "n": len(entries),
-            "context_recall": round(_avg([e["recall"] for e in entries]), 4),
-            "mrr":            round(_avg([e["mrr"]    for e in entries]), 4),
+            "context_recall": round(_avg([e["recall"] for e in ans]), 4),
+            "mrr":            round(_avg([e["mrr"]    for e in ans]), 4),
             "avg_retrieval_ms": round(_avg([e["retrieval_ms"] for e in entries]), 2),
         }
         if with_generation:
-            s["answer_f1"]   = round(_avg([e.get("f1",  0.0)          for e in entries]), 4)
-            s["exact_match"] = round(_avg([float(e.get("em", False))   for e in entries]), 4)
+            s["answer_f1"]   = round(_avg([e.get("f1",  0.0)          for e in ans]), 4)
+            s["exact_match"] = round(_avg([float(e.get("em", False))   for e in ans]), 4)
+        if negatives:
+            neg = [r[name] for r in negatives]
+            # hallucination = produced a substantive answer instead of abstaining
+            s["hallucination_rate"] = round(
+                _avg([0.0 if e.get("abstained") else 1.0 for e in neg]), 4
+            )
         if name in ragas_scores:
             s["faithfulness"]     = ragas_scores[name]["faithfulness"]
             s["answer_relevancy"] = ragas_scores[name]["answer_relevancy"]
@@ -763,6 +802,9 @@ def _print_results(summary: dict, with_generation: bool, with_ragas: bool,
         print("-" * w)
         row("RAGAS Faithfulness",     "faithfulness")
         row("RAGAS Answer Relevancy", "answer_relevancy")
+    if "hallucination_rate" in n:
+        print("-" * w)
+        row("Hallucination Rate (neg)", "hallucination_rate")
     print("=" * w)
 
 
@@ -783,34 +825,50 @@ def _significance_tests(records: list[dict], with_generation: bool) -> dict:
         print("Install with: pip install scipy")
         return {}
 
+    # Retrieval/answer tests run over answerable questions only; the
+    # hallucination test runs over the unanswerable ones.
+    answerable = [r for r in records if r.get("answerable", True)]
+    negatives = [r for r in records if not r.get("answerable", True)]
+
     tests: dict = {}
 
     continuous = [("MRR", "mrr")]
     if with_generation:
         continuous.append(("Answer F1", "f1"))
     for label, key in continuous:
-        naive_vals = [r["naive"][key] for r in records]
-        adv_vals = [r["advanced"][key] for r in records]
-        if all(av == nv for av, nv in zip(adv_vals, naive_vals)):
-            p = float("nan")  # wilcoxon errors on all-zero differences
+        naive_vals = [r["naive"][key] for r in answerable]
+        adv_vals = [r["advanced"][key] for r in answerable]
+        if not answerable or all(av == nv for av, nv in zip(adv_vals, naive_vals)):
+            p = float("nan")  # wilcoxon errors on all-zero / empty differences
         else:
             try:
                 _, p = wilcoxon(adv_vals, naive_vals)
             except ValueError:
                 p = float("nan")
-        tests[label] = {"test": "Wilcoxon", "p": p, "n": len(records)}
+        tests[label] = {"test": "Wilcoxon", "p": p, "n": len(answerable)}
 
     binary = [("Context Recall@K", "recall")]
     if with_generation:
         binary.append(("Exact Match", "em"))
     for label, key in binary:
         # McNemar on discordant pairs: how often each pipeline alone succeeds.
-        adv_only = sum(1 for r in records if r["advanced"][key] and not r["naive"][key])
-        naive_only = sum(1 for r in records if r["naive"][key] and not r["advanced"][key])
+        adv_only = sum(1 for r in answerable if r["advanced"][key] and not r["naive"][key])
+        naive_only = sum(1 for r in answerable if r["naive"][key] and not r["advanced"][key])
         discordant = adv_only + naive_only
         p = 1.0 if discordant == 0 else binomtest(min(adv_only, naive_only), discordant, 0.5).pvalue
         tests[label] = {
-            "test": "McNemar", "p": p, "n": len(records),
+            "test": "McNemar", "p": p, "n": len(answerable),
+            "adv_better": adv_only, "naive_better": naive_only,
+        }
+
+    # Hallucination resistance on unanswerable questions: "better" = abstained.
+    if negatives:
+        adv_only = sum(1 for r in negatives if r["advanced"].get("abstained") and not r["naive"].get("abstained"))
+        naive_only = sum(1 for r in negatives if r["naive"].get("abstained") and not r["advanced"].get("abstained"))
+        discordant = adv_only + naive_only
+        p = 1.0 if discordant == 0 else binomtest(min(adv_only, naive_only), discordant, 0.5).pvalue
+        tests["Abstention (neg)"] = {
+            "test": "McNemar", "p": p, "n": len(negatives),
             "adv_better": adv_only, "naive_better": naive_only,
         }
 
