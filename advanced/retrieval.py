@@ -7,6 +7,7 @@ Dense (ChromaDB cosine similarity) + Sparse (BM25) + RRF + Cross-encoder reranki
 from __future__ import annotations
 
 import os
+import threading
 
 import bm25s
 import chromadb
@@ -14,6 +15,11 @@ import torch
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from datasets_registry import CHROMA_PATH, active, active_key
+
+# Guards the lazy singletons below. advanced/pipeline.py builds dense + BM25
+# results across several query variants in parallel threads, so the first
+# (cache-miss) build must not be entered by more than one thread at once.
+_init_lock = threading.RLock()
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -129,8 +135,11 @@ def rerank(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
 
 def _get_embedder() -> SentenceTransformer:
     global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE)
+    if _embedder is not None:
+        return _embedder
+    with _init_lock:
+        if _embedder is None:
+            _embedder = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE)
     return _embedder
 
 
@@ -138,23 +147,29 @@ def _get_collection() -> chromadb.Collection:
     global _collection, _collection_key, _bm25_index, _bm25_corpus
     if _collection is not None and _collection_key == active_key():
         return _collection
-    # Dataset switched (or first call): drop any stale BM25 state too.
-    _bm25_index = None
-    _bm25_corpus = None
-    CHROMA_PATH.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(CHROMA_PATH))
-    _collection = client.get_or_create_collection(
-        active().collection_name,
-        metadata={"hnsw:space": "cosine"},
-    )
-    _collection_key = active_key()
+    with _init_lock:
+        if _collection is not None and _collection_key == active_key():
+            return _collection
+        # Dataset switched (or first call): drop any stale BM25 state too.
+        _bm25_index = None
+        _bm25_corpus = None
+        CHROMA_PATH.mkdir(parents=True, exist_ok=True)
+        client = chromadb.PersistentClient(path=str(CHROMA_PATH))
+        _collection = client.get_or_create_collection(
+            active().collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        _collection_key = active_key()
     return _collection
 
 
 def _get_reranker() -> CrossEncoder:
     global _reranker
-    if _reranker is None:
-        _reranker = CrossEncoder(RERANKER_MODEL, device=DEVICE)
+    if _reranker is not None:
+        return _reranker
+    with _init_lock:
+        if _reranker is None:
+            _reranker = CrossEncoder(RERANKER_MODEL, device=DEVICE)
     return _reranker
 
 
@@ -165,35 +180,46 @@ def _get_bm25() -> tuple[bm25s.BM25, list[dict]]:
 
     import json
 
-    # Use bm25s' native save/load (NOT pickle) — pickled BM25 objects lose the
-    # `scores` index across library versions/machines. The doc corpus (text +
-    # title) is stored alongside as JSON.
-    cache_dir = active().bm25_cache_dir
-    corpus_file = cache_dir / "corpus.json"
+    with _init_lock:
+        # Re-check inside the lock: another thread may have built it already.
+        if _bm25_index is not None and _bm25_corpus is not None and _bm25_key == active_key():
+            return _bm25_index, _bm25_corpus
 
-    if cache_dir.exists() and corpus_file.exists():
-        _bm25_index = bm25s.BM25.load(str(cache_dir), mmap=False)
-        with open(corpus_file) as f:
-            _bm25_corpus = json.load(f)
+        # Use bm25s' native save/load (NOT pickle) — pickled BM25 objects lose
+        # the `scores` index across library versions/machines. The doc corpus
+        # (text + title) is stored alongside as JSON.
+        cache_dir = active().bm25_cache_dir
+        corpus_file = cache_dir / "corpus.json"
+
+        if cache_dir.exists() and corpus_file.exists():
+            _bm25_index = bm25s.BM25.load(str(cache_dir), mmap=False)
+            with open(corpus_file) as f:
+                _bm25_corpus = json.load(f)
+            _bm25_key = active_key()
+            return _bm25_index, _bm25_corpus
+
+        col = _get_collection()
+        all_docs = col.get(include=["documents", "metadatas"])
+
+        corpus = [
+            {"text": text, "title": meta.get("title", "")}
+            for text, meta in zip(all_docs["documents"], all_docs["metadatas"])
+        ]
+
+        corpus_tokens = bm25s.tokenize([doc["text"] for doc in corpus])
+        index = bm25s.BM25()
+        index.index(corpus_tokens)
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        index.save(str(cache_dir))
+        with open(corpus_file, "w") as f:
+            json.dump(corpus, f)
+
+        # Publish to the globals only once fully built, so no other thread can
+        # observe a half-initialised index.
+        _bm25_corpus = corpus
+        _bm25_index = index
         _bm25_key = active_key()
-        return _bm25_index, _bm25_corpus
-
-    col = _get_collection()
-    all_docs = col.get(include=["documents", "metadatas"])
-
-    _bm25_corpus = [
-        {"text": text, "title": meta.get("title", "")}
-        for text, meta in zip(all_docs["documents"], all_docs["metadatas"])
-    ]
-
-    corpus_tokens = bm25s.tokenize([doc["text"] for doc in _bm25_corpus])
-    _bm25_index = bm25s.BM25()
-    _bm25_index.index(corpus_tokens)
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    _bm25_index.save(str(cache_dir))
-    with open(corpus_file, "w") as f:
-        json.dump(_bm25_corpus, f)
 
     _bm25_key = active_key()
     return _bm25_index, _bm25_corpus
