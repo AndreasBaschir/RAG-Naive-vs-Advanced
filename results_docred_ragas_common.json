@@ -1,0 +1,22 @@
+{
+  "dataset": "docred",
+  "context_source": "retrieved",
+  "n_common_total": 70,
+  "seeds": [
+    42,
+    1042,
+    2042
+  ],
+  "naive": {
+    "faithfulness": 0.9398,
+    "faithfulness_std": 0.0117,
+    "answer_relevancy": 0.8766,
+    "answer_relevancy_std": 0.015
+  },
+  "advanced": {
+    "faithfulness": 0.9349,
+    "faithfulness_std": 0.0092,
+    "answer_relevancy": 0.8776,
+    "answer_relevancy_std": 0.0219
+  }
+}
