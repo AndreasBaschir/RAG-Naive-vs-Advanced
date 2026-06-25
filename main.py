@@ -10,9 +10,14 @@ from naive import pipeline as naive
 
 
 @st.cache_resource
-def _warmup(dataset: str):
-    # `dataset` keys the cache so switching datasets rebuilds the singletons
-    # against the newly-selected ChromaDB collection / BM25 index.
+def _warmup(dataset: str) -> None:
+    """Load all lazy singletons for the selected dataset into memory.
+
+    Keyed by *dataset* so Streamlit rebuilds singletons when the user
+    switches datasets in the sidebar.
+
+    :param dataset: dataset key used as the Streamlit cache key
+    """
     datasets_registry.set_active(dataset)
     naive._get_embedder()
     _adv_embedder()
@@ -32,13 +37,19 @@ if "messages" not in st.session_state:
 
 
 def get_response(pipeline, prompt: str, chunks: list[dict]) -> tuple[str, float]:
+    """Stream a full response from *pipeline* and measure wall-clock latency.
+
+    :param pipeline: naive or advanced pipeline module (must expose ``stream``)
+    :param prompt: user question
+    :param chunks: retrieved context chunks passed to the pipeline
+    :returns: tuple of (generated answer text, elapsed seconds)
+    """
     start = time.perf_counter()
     result = "".join(pipeline.stream(prompt, chunks))
     elapsed = time.perf_counter() - start
     return result, elapsed
 
 
-# Afișare istoric
 for msg in st.session_state.messages:
     with st.chat_message("user"):
         st.markdown(msg["prompt"])
@@ -49,7 +60,6 @@ for msg in st.session_state.messages:
     col2.subheader(f"Advanced RAG — {msg['adv_time']:.2f}s")
     col2.markdown(msg["advanced"])
 
-# Input
 if prompt := st.chat_input("Ask anything..."):
     with st.chat_message("user"):
         st.markdown(prompt)

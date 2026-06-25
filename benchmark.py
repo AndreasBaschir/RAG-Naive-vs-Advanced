@@ -49,13 +49,11 @@ DEFAULT_SAMPLES = 200
 DEFAULT_SEED = 42
 DEFAULT_NUM_SEEDS = 4
 
-# Substring that identifies a grounded "I can't answer from context" refusal,
-# emitted by both pipelines' system prompts. Such answers must be excluded from
-# RAGAS answer_relevancy, which would otherwise penalise a correct refusal.
 REFUSAL_MARKER = "does not contain enough information"
 
 
 def main() -> None:
+    """Parse CLI arguments and run the full benchmark pipeline."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -94,8 +92,6 @@ def main() -> None:
     if args.with_ragas:
         args.with_generation = True
 
-    # Select the active dataset BEFORE any pipeline call so the lazy singletons
-    # resolve the right ChromaDB collection / BM25 cache.
     datasets_registry.set_active(args.dataset)
     spec = datasets_registry.active()
 
@@ -103,7 +99,6 @@ def main() -> None:
         _ragas_from_file(args)
         return
 
-    # Derive reproducible seeds from the base seed
     seeds = [args.seed + i * 1000 for i in range(args.num_seeds)]
 
     print(f"Loading '{args.dataset}' evaluation rows...")
@@ -127,13 +122,8 @@ def main() -> None:
         print(f"--- Seed {seed_idx + 1}/{len(seeds)}  (seed={seed}, {args.samples} questions) ---")
 
         rng = random.Random(seed)
-        # Oversample the candidate pool, then keep the first N rows that yield a
-        # usable record (make_record may return None, e.g. a DocRED doc with no
-        # usable triple), so each seed still produces args.samples questions.
-        # A neg_frac fraction is turned into UNANSWERABLE questions to measure
-        # hallucination resistance (only when generation runs and the dataset
-        # provides a negative maker).
         make_neg = spec.make_negative_record if args.with_generation else None
+        # Oversample 2× so we can absorb None returns from make_record/make_neg.
         pool = rng.sample(rows, min(args.samples * 2, len(rows)))
         sample: list[dict] = []
         for row in pool:
@@ -181,7 +171,6 @@ def main() -> None:
                         )
                         entry["em"] = any(_exact_match(answer, ref) for ref in gold_answers)
 
-                        # Only answerable questions are scored by RAGAS.
                         if args.with_ragas:
                             ragas_rows[name].append({
                                 "question": question,
@@ -204,12 +193,9 @@ def main() -> None:
 
         per_seed_summaries.append(_build_summary(records, args.with_generation, ragas_scores))
 
-        # Write a checkpoint after every seed so a crash doesn't lose all work.
         if args.output:
             _write_checkpoint(args.output, per_seed_summaries, all_records, seeds)
 
-    # Aggregate across seeds. Display flags are derived from the aggregated
-    # summary so a metric only shows up when it survived for every seed.
     final_summary = _aggregate_summaries(per_seed_summaries)
     multi_seed = len(seeds) > 1
     has_generation = "answer_f1" in final_summary["naive"]
@@ -238,12 +224,16 @@ def main() -> None:
                       args.figures_dir, multi_seed, len(seeds), args.dataset)
 
 
-# --------------------------------------------------------------------------- #
-# Aggregation                                                                  #
-# --------------------------------------------------------------------------- #
-
 def _ragas_from_file(args) -> None:
-    """Load a completed results.json and run RAGAS on the stored answers."""
+    """Load a completed results JSON and run RAGAS on the stored answers.
+
+    Retrieved chunk texts are not stored in the JSON, so RAGAS faithfulness
+    is scored against the gold context. Unanswerable (negative) records are
+    excluded — they have no gold answer to be faithful to.
+
+    :param args: parsed CLI namespace (uses ``args.ragas_from``, ``args.output``,
+                 ``args.ragas_workers``, ``args.plot``, ``args.figures_dir``)
+    """
     with open(args.ragas_from) as fh:
         data = json.load(fh)
 
@@ -251,7 +241,6 @@ def _ragas_from_file(args) -> None:
     per_seed_summaries: list[dict] = data["per_seed_summaries"]
     seeds: list[int] = data["seeds"]
 
-    # Group records back by seed, build ragas_rows per seed
     records_by_seed: dict[int, list[dict]] = {}
     for r in all_records:
         records_by_seed.setdefault(r["seed"], []).append(r)
@@ -259,9 +248,6 @@ def _ragas_from_file(args) -> None:
     updated_summaries = []
     for seed_idx, (seed, summary) in enumerate(zip(seeds, per_seed_summaries)):
         records = records_by_seed.get(seed, [])
-        # Retrieved chunk texts aren't stored in the JSON, so RAGAS faithfulness
-        # is judged against the gold context. Unanswerable (negative) records are
-        # excluded — they have no gold answer to be faithful to.
         ragas_rows: dict[str, list[dict]] = {"naive": [], "advanced": []}
         for r in records:
             if not r.get("answerable", True):
@@ -287,13 +273,12 @@ def _ragas_from_file(args) -> None:
                 updated[name]["answer_relevancy"] = ragas_scores[name]["answer_relevancy"]
         updated_summaries.append(updated)
 
-        # Checkpoint after each seed's RAGAS so a crash mid-run isn't fatal.
         if args.output:
             data["per_seed_summaries"] = updated_summaries + per_seed_summaries[len(updated_summaries):]
             tmp = args.output + ".tmp"
             with open(tmp, "w") as fh:
                 json.dump(data, fh, indent=2)
-            os.replace(tmp, args.output)
+            os.replace(tmp, args.output)  # atomic replace — no partial-write corruption
             print(f"  Checkpoint saved ({len(updated_summaries)}/{len(seeds)} seeds).")
 
     final_summary = _aggregate_summaries(updated_summaries)
@@ -323,6 +308,13 @@ def _ragas_from_file(args) -> None:
 
 def _write_checkpoint(path: str, per_seed_summaries: list[dict],
                       all_records: list[dict], seeds: list[int]) -> None:
+    """Write a partial-results checkpoint so a mid-run crash loses at most one seed.
+
+    :param path: destination file path
+    :param per_seed_summaries: summaries for seeds completed so far
+    :param all_records: all per-question records accumulated so far
+    :param seeds: full seed list for the run
+    """
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         json.dump({
@@ -335,10 +327,14 @@ def _write_checkpoint(path: str, per_seed_summaries: list[dict],
 
 
 def _aggregate_summaries(summaries: list[dict]) -> dict:
-    """Mean ± sample-std across per-seed summaries. Single seed → std omitted.
+    """Compute mean ± sample-std across per-seed summaries.
 
     Only metrics present in *every* seed are aggregated, so a RAGAS failure on
-    one seed can neither crash the run nor silently corrupt the output table.
+    one seed neither crashes the run nor silently corrupts the output table.
+    Single-seed runs return the summary unchanged (no std column).
+
+    :param summaries: list of per-seed summary dicts (one per seed)
+    :returns: aggregated summary dict with ``{key}`` and ``{key}_std`` entries
     """
     if len(summaries) == 1:
         return summaries[0]
@@ -347,7 +343,6 @@ def _aggregate_summaries(summaries: list[dict]) -> dict:
     for name in ("naive", "advanced"):
         pipeline_runs = [s[name] for s in summaries]
 
-        # Keep only keys present in all seeds and numeric in all seeds.
         common_keys = set(pipeline_runs[0])
         for r in pipeline_runs[1:]:
             common_keys &= set(r)
@@ -365,12 +360,22 @@ def _aggregate_summaries(summaries: list[dict]) -> dict:
     return result
 
 
-# --------------------------------------------------------------------------- #
-# RAGAS evaluation                                                             #
-# --------------------------------------------------------------------------- #
-
 def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b",
                ragas_workers: int = 4) -> dict:
+    """Evaluate faithfulness and answer_relevancy with RAGAS for each pipeline.
+
+    Grounded-refusal answers (containing ``REFUSAL_MARKER``) are excluded
+    from scoring because penalising a correct abstention distorts the metric.
+
+    ``num_ctx=4096`` is intentional: RAGAS prompts are well under 4 K tokens,
+    so the model's 40 K default wastes KV-cache and reduces parallelism.
+
+    :param rows_by_pipeline: ``{"naive": [...], "advanced": [...]}`` where each
+                             entry has ``question``, ``answer``, ``contexts``
+    :param llm_model: Ollama model name used as RAGAS judge
+    :param ragas_workers: max concurrent judge calls (match ``OLLAMA_NUM_PARALLEL``)
+    :returns: ``{"naive": {"faithfulness": float, "answer_relevancy": float}, ...}``
+    """
     try:
         from ragas import EvaluationDataset, SingleTurnSample, evaluate
         from ragas.llms import LangchainLLMWrapper
@@ -383,10 +388,6 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b",
         print("Install with: pip install ragas langchain-ollama langchain-community")
         return {}
 
-    # num_ctx is kept small on purpose: RAGAS prompts (a question + a few SQuAD
-    # passages) are well under 4K tokens, so qwen3's 40K default just wastes
-    # ~15GB of KV cache and blocks parallel slots. A small context lets several
-    # requests run concurrently within the A5000's 24GB.
     llm = LangchainLLMWrapper(ChatOllama(model=llm_model, num_ctx=4096))
     embeddings = LangchainEmbeddingsWrapper(
         HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -397,8 +398,6 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b",
         if not rows:
             continue
 
-        # Drop grounded refusals: scoring them for answer_relevancy unfairly
-        # penalises a pipeline for correctly declining to answer.
         usable = [r for r in rows
                   if REFUSAL_MARKER not in r["answer"].lower()
                   and not r["answer"].startswith("[ERROR:")]
@@ -420,9 +419,6 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b",
         ]
         dataset = EvaluationDataset(samples=samples)
         from ragas import RunConfig
-        # max_workers must match Ollama's OLLAMA_NUM_PARALLEL: more workers than
-        # Ollama can serve concurrently just makes the surplus queue past the
-        # per-job timeout. A generous timeout covers a full slow generation.
         result = evaluate(
             dataset=dataset,
             metrics=[Faithfulness(), ResponseRelevancy()],
@@ -441,13 +437,19 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b",
     return results
 
 
-# --------------------------------------------------------------------------- #
-# Figures                                                                      #
-# --------------------------------------------------------------------------- #
-
 def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
                   out_dir: str, multi_seed: bool, num_seeds: int = DEFAULT_NUM_SEEDS,
                   dataset: str = "squad") -> None:
+    """Generate and save thesis-ready figures (PDF + PNG) from *summary*.
+
+    :param summary: aggregated benchmark summary dict
+    :param with_generation: whether answer-quality metrics are present
+    :param with_ragas: whether RAGAS metrics are present
+    :param out_dir: directory to write figure files into
+    :param multi_seed: whether to render error bars
+    :param num_seeds: seed count, shown in axis labels when *multi_seed*
+    :param dataset: dataset key used to prefix output filenames and axis titles
+    """
     try:
         import matplotlib.pyplot as plt
         import matplotlib.ticker as mticker
@@ -478,15 +480,23 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
 
     n = summary["naive"]
     a = summary["advanced"]
-    ds_label = dataset.upper()  # e.g. "SQUAD", "DOCRED" — appended to titles
+    ds_label = dataset.upper()
 
     def _get(d: dict, key: str) -> tuple[float, float]:
-        """Return (mean, std) for a metric. std=0 when no multi-seed."""
+        """Return ``(mean, std)`` for *key*; std is 0.0 when not multi-seed.
+
+        :param d: pipeline summary sub-dict
+        :param key: metric name
+        :returns: (mean, std) pair
+        """
         return d[key], d.get(f"{key}_std", 0.0)
 
     def _save(fig: "plt.Figure", name: str) -> None:
-        # Prefix filenames with the dataset so SQuAD/DocRED runs into the same
-        # figures dir don't overwrite each other.
+        """Save *fig* as ``{dataset}_{name}.pdf`` and ``.png`` in *out_dir*.
+
+        :param fig: matplotlib figure to save
+        :param name: base filename suffix (without extension)
+        """
         fname = f"{dataset}_{name}"
         for ext in ("pdf", "png"):
             fig.savefig(os.path.join(out_dir, f"{fname}.{ext}"), dpi=300, bbox_inches="tight")
@@ -495,6 +505,15 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
 
     def _grouped_bars(ax, labels, naive_vals, adv_vals,
                       naive_errs=None, adv_errs=None) -> None:
+        """Draw side-by-side bars for Naive RAG and Advanced RAG on *ax*.
+
+        :param ax: matplotlib axes to draw on
+        :param labels: x-axis tick labels
+        :param naive_vals: bar heights for Naive RAG
+        :param adv_vals: bar heights for Advanced RAG
+        :param naive_errs: optional error bar sizes for Naive RAG
+        :param adv_errs: optional error bar sizes for Advanced RAG
+        """
         x   = np.arange(len(labels))
         w   = 0.35
         kw  = {"capsize": 5, "error_kw": {"elinewidth": 1.2}} if multi_seed else {}
@@ -514,9 +533,6 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
 
     print(f"\nGenerating figures in '{out_dir}/'...")
 
-    # ------------------------------------------------------------------ #
-    # Figure 1 — Retrieval metrics                                        #
-    # ------------------------------------------------------------------ #
     fig, ax = plt.subplots(figsize=(6, 4.5))
     n_rc, n_rc_std = _get(n, "context_recall")
     a_rc, a_rc_std = _get(a, "context_recall")
@@ -535,9 +551,6 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
     fig.tight_layout()
     _save(fig, "retrieval_metrics")
 
-    # ------------------------------------------------------------------ #
-    # Figure 2 — Latency                                                  #
-    # ------------------------------------------------------------------ #
     fig, ax = plt.subplots(figsize=(5, 4))
     n_lat, n_lat_std = _get(n, "avg_retrieval_ms")
     a_lat, a_lat_std = _get(a, "avg_retrieval_ms")
@@ -559,9 +572,6 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
     fig.tight_layout()
     _save(fig, "latency")
 
-    # ------------------------------------------------------------------ #
-    # Figure 3 — Answer quality                                           #
-    # ------------------------------------------------------------------ #
     if with_generation:
         fig, ax = plt.subplots(figsize=(6, 4.5))
         n_f1, n_f1_std = _get(n, "answer_f1")
@@ -581,9 +591,6 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
         fig.tight_layout()
         _save(fig, "answer_quality")
 
-    # ------------------------------------------------------------------ #
-    # Figure 4 — RAGAS metrics                                            #
-    # ------------------------------------------------------------------ #
     if with_ragas:
         fig, ax = plt.subplots(figsize=(6, 4.5))
         n_fa, n_fa_std = _get(n, "faithfulness")
@@ -603,9 +610,6 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
         fig.tight_layout()
         _save(fig, "ragas_metrics")
 
-    # ------------------------------------------------------------------ #
-    # Figure 4b — Hallucination rate on unanswerable questions            #
-    # ------------------------------------------------------------------ #
     if "hallucination_rate" in n:
         fig, ax = plt.subplots(figsize=(5, 4))
         n_h, n_h_std = _get(n, "hallucination_rate")
@@ -625,9 +629,6 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
         fig.tight_layout()
         _save(fig, "hallucination")
 
-    # ------------------------------------------------------------------ #
-    # Figure 5 — Radar overview                                           #
-    # ------------------------------------------------------------------ #
     metric_names: list[str] = ["Context\nRecall@K", "MRR"]
     naive_radar:  list[float] = [n["context_recall"], n["mrr"]]
     adv_radar:    list[float] = [a["context_recall"], a["mrr"]]
@@ -641,11 +642,7 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
         naive_radar  += [n["faithfulness"], n["answer_relevancy"]]
         adv_radar    += [a["faithfulness"], a["answer_relevancy"]]
 
-    # NOTE: latency is intentionally omitted from the radar. It lives on a
-    # different (millisecond) scale and would only be representable as a
-    # relative ratio, which mixes absolute quality scores with a relative one
-    # on the same 0-1 axis and misleads the reader. See the latency figure.
-
+    # Latency omitted: its ms scale would need a ratio to fit 0-1, mixing unit types with quality scores.
     num_vars = len(metric_names)
     angles = [i * 2 * math.pi / num_vars for i in range(num_vars)]
     angles += angles[:1]
@@ -668,18 +665,18 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
     print("Include in LaTeX with:  \\includegraphics[width=\\linewidth]{figures/<name>.pdf}")
 
 
-# --------------------------------------------------------------------------- #
-# Metrics                                                                      #
-# --------------------------------------------------------------------------- #
-
 def _context_rank(chunks: list[dict], gold_answers: list[str],
                   gold_title: str | None = None) -> int | None:
-    """
-    1-based rank of the first chunk that contains a gold answer span, or None.
+    """Return the 1-based rank of the first chunk containing a gold answer span.
 
-    When gold_title is given, a chunk only counts if it also comes from the
-    correct SQuAD article. This prevents short answer spans (e.g. "May", "US")
-    from spuriously matching unrelated passages and inflating recall.
+    When *gold_title* is given, a chunk only counts if it also comes from the
+    correct article. This prevents short answer spans (e.g. "May", "US") from
+    spuriously matching unrelated passages and inflating recall.
+
+    :param chunks: ranked list of retrieved chunk dicts
+    :param gold_answers: list of acceptable answer strings
+    :param gold_title: source title the matching chunk must come from (optional)
+    :returns: 1-based rank, or ``None`` if no chunk matched
     """
     golds = [a.lower() for a in gold_answers]
     title = gold_title.strip().lower() if gold_title else None
@@ -693,11 +690,22 @@ def _context_rank(chunks: list[dict], gold_answers: list[str],
 
 
 def _normalize(text: str) -> str:
+    """Lowercase *text*, strip punctuation, and collapse whitespace.
+
+    :param text: raw text string
+    :returns: normalised token string
+    """
     text = text.lower().translate(str.maketrans("", "", string.punctuation))
     return " ".join(text.split())
 
 
 def _token_f1(prediction: str, reference: str) -> float:
+    """Compute SQuAD-style token-F1 between *prediction* and *reference*.
+
+    :param prediction: generated answer text
+    :param reference: gold reference answer text
+    :returns: F1 score in [0, 1]
+    """
     pred_tokens = _normalize(prediction).split()
     ref_tokens  = _normalize(reference).split()
     common      = Counter(pred_tokens) & Counter(ref_tokens)
@@ -710,25 +718,44 @@ def _token_f1(prediction: str, reference: str) -> float:
 
 
 def _exact_match(prediction: str, reference: str) -> bool:
+    """Return ``True`` if the normalised *reference* is a substring of normalised *prediction*.
+
+    :param prediction: generated answer text
+    :param reference: gold reference answer text
+    :returns: whether the prediction contains the reference after normalisation
+    """
     return _normalize(reference) in _normalize(prediction)
 
 
-# --------------------------------------------------------------------------- #
-# Output                                                                       #
-# --------------------------------------------------------------------------- #
-
 def _avg(values: list) -> float:
+    """Return the arithmetic mean of *values*, or 0.0 for an empty list.
+
+    :param values: list of numeric values
+    :returns: mean value
+    """
     return sum(values) / len(values) if values else 0.0
 
 
 def _sample_std(values: list) -> float:
-    """Sample standard deviation (ddof=1). Returns 0.0 for <2 values."""
+    """Return sample standard deviation (ddof=1), or 0.0 for fewer than 2 values.
+
+    :param values: list of numeric values
+    :returns: sample standard deviation
+    """
     return statistics.stdev(values) if len(values) > 1 else 0.0
 
 
 def _build_summary(records: list[dict], with_generation: bool, ragas_scores: dict) -> dict:
-    # Retrieval/answer-quality metrics are computed over answerable questions
-    # only; the hallucination metric is computed over the unanswerable ones.
+    """Build a per-seed metric summary from evaluated *records*.
+
+    Retrieval and answer-quality metrics are computed over answerable questions
+    only; the hallucination metric is computed over the unanswerable ones.
+
+    :param records: list of per-question result dicts (both pipelines in each)
+    :param with_generation: whether answer-quality fields are present in records
+    :param ragas_scores: RAGAS scores dict returned by :func:`_run_ragas`, or ``{}``
+    :returns: summary dict keyed by ``"naive"`` and ``"advanced"``
+    """
     answerable = [r for r in records if r.get("answerable", True)]
     negatives = [r for r in records if not r.get("answerable", True)]
 
@@ -747,7 +774,6 @@ def _build_summary(records: list[dict], with_generation: bool, ragas_scores: dic
             s["exact_match"] = round(_avg([float(e.get("em", False))   for e in ans]), 4)
         if negatives:
             neg = [r[name] for r in negatives]
-            # hallucination = produced a substantive answer instead of abstaining
             s["hallucination_rate"] = round(
                 _avg([0.0 if e.get("abstained") else 1.0 for e in neg]), 4
             )
@@ -759,6 +785,13 @@ def _build_summary(records: list[dict], with_generation: bool, ragas_scores: dic
 
 
 def _fmt(summary: dict, key: str, multi_seed: bool) -> str:
+    """Format a metric value as ``"mean"`` or ``"mean ± std"`` for display.
+
+    :param summary: pipeline summary sub-dict
+    :param key: metric name
+    :param multi_seed: whether to append the std column
+    :returns: formatted string
+    """
     mean = summary[key]
     std  = summary.get(f"{key}_std")
     if multi_seed and std is not None:
@@ -768,6 +801,14 @@ def _fmt(summary: dict, key: str, multi_seed: bool) -> str:
 
 def _print_results(summary: dict, with_generation: bool, with_ragas: bool,
                    multi_seed: bool, num_seeds: int = DEFAULT_NUM_SEEDS) -> None:
+    """Print the benchmark results table to stdout.
+
+    :param summary: aggregated summary dict
+    :param with_generation: whether to include answer-quality rows
+    :param with_ragas: whether to include RAGAS metric rows
+    :param multi_seed: whether to show ± std columns
+    :param num_seeds: seed count for the header annotation
+    """
     n = summary["naive"]
     a = summary["advanced"]
     col_w = 18 if multi_seed else 14
@@ -783,6 +824,11 @@ def _print_results(summary: dict, with_generation: bool, with_ragas: bool,
     print("-" * w)
 
     def row(label: str, key: str) -> None:
+        """Print a single metric row.
+
+        :param label: display name for the metric
+        :param key: key in the summary dict
+        """
         nv = _fmt(n, key, multi_seed)
         av = _fmt(a, key, multi_seed)
         print(f"{label:<30} {nv:>{col_w}} {av:>{col_w}}")
@@ -809,14 +855,16 @@ def _print_results(summary: dict, with_generation: bool, with_ragas: bool,
 
 
 def _significance_tests(records: list[dict], with_generation: bool) -> dict:
-    """
-    Paired Advanced-vs-Naive significance tests over the pooled per-question
-    results (all seeds combined):
+    """Run paired Advanced-vs-Naive significance tests over pooled per-question results.
 
-      continuous metrics (mrr, answer_f1) — Wilcoxon signed-rank test
-      binary metrics (recall, exact_match) — McNemar test (exact binomial)
+    Continuous metrics (MRR, answer_f1) use the Wilcoxon signed-rank test.
+    Binary metrics (recall, exact_match) use McNemar's test (exact binomial).
+    All tests run over answerable questions only; the hallucination abstention
+    test runs over the unanswerable subset.
 
-    Returns {} if scipy is unavailable.
+    :param records: all per-question result dicts across all seeds
+    :param with_generation: whether answer-quality metrics are present
+    :returns: ``{}`` if scipy is unavailable; otherwise a dict of test results
     """
     try:
         from scipy.stats import binomtest, wilcoxon
@@ -825,8 +873,6 @@ def _significance_tests(records: list[dict], with_generation: bool) -> dict:
         print("Install with: pip install scipy")
         return {}
 
-    # Retrieval/answer tests run over answerable questions only; the
-    # hallucination test runs over the unanswerable ones.
     answerable = [r for r in records if r.get("answerable", True)]
     negatives = [r for r in records if not r.get("answerable", True)]
 
@@ -839,7 +885,7 @@ def _significance_tests(records: list[dict], with_generation: bool) -> dict:
         naive_vals = [r["naive"][key] for r in answerable]
         adv_vals = [r["advanced"][key] for r in answerable]
         if not answerable or all(av == nv for av, nv in zip(adv_vals, naive_vals)):
-            p = float("nan")  # wilcoxon errors on all-zero / empty differences
+            p = float("nan")
         else:
             try:
                 _, p = wilcoxon(adv_vals, naive_vals)
@@ -851,7 +897,6 @@ def _significance_tests(records: list[dict], with_generation: bool) -> dict:
     if with_generation:
         binary.append(("Exact Match", "em"))
     for label, key in binary:
-        # McNemar on discordant pairs: how often each pipeline alone succeeds.
         adv_only = sum(1 for r in answerable if r["advanced"][key] and not r["naive"][key])
         naive_only = sum(1 for r in answerable if r["naive"][key] and not r["advanced"][key])
         discordant = adv_only + naive_only
@@ -861,7 +906,6 @@ def _significance_tests(records: list[dict], with_generation: bool) -> dict:
             "adv_better": adv_only, "naive_better": naive_only,
         }
 
-    # Hallucination resistance on unanswerable questions: "better" = abstained.
     if negatives:
         adv_only = sum(1 for r in negatives if r["advanced"].get("abstained") and not r["naive"].get("abstained"))
         naive_only = sum(1 for r in negatives if r["naive"].get("abstained") and not r["advanced"].get("abstained"))
@@ -876,6 +920,10 @@ def _significance_tests(records: list[dict], with_generation: bool) -> dict:
 
 
 def _print_significance(tests: dict) -> None:
+    """Print the significance test results table to stdout.
+
+    :param tests: dict returned by :func:`_significance_tests`
+    """
     if not tests:
         return
     print("\nPaired significance tests (Advanced vs Naive, pooled questions):")
@@ -890,6 +938,11 @@ def _print_significance(tests: dict) -> None:
 
 
 def _print_progress(current: int, total: int) -> None:
+    """Print or update an ASCII progress bar on stdout.
+
+    :param current: number of items processed so far
+    :param total: total number of items
+    """
     pct    = current / total
     bar_len = 38
     filled  = int(bar_len * pct)

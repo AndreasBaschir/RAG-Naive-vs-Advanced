@@ -33,10 +33,16 @@ ADV_COLOR = "#DD8452"
 
 
 def _scorable(answer: str) -> bool:
+    """Return ``True`` if *answer* is a substantive, non-error response.
+
+    :param answer: pipeline answer string
+    :returns: ``False`` for empty strings, refusals, and ``[ERROR:...]`` answers
+    """
     return bool(answer) and REFUSAL_MARKER not in answer.lower() and not answer.startswith("[ERROR:")
 
 
 def main() -> None:
+    """Run the common-subset RAGAS analysis from CLI arguments."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input", default="results_docred.json",
@@ -73,7 +79,6 @@ def main() -> None:
         retrievers = {"naive": naive, "advanced": adv}
         print("Ready.\n")
 
-    # Per-seed RAGAS on the common subset, then mean ± std across seeds.
     per_seed: dict[str, dict[str, list[float]]] = {
         "naive": {"faithfulness": [], "answer_relevancy": []},
         "advanced": {"faithfulness": [], "answer_relevancy": []},
@@ -136,6 +141,10 @@ def main() -> None:
 
 
 def _print_summary(s: dict) -> None:
+    """Print the common-subset RAGAS results table to stdout.
+
+    :param s: summary dict as built by :func:`main`
+    """
     n, a = s["naive"], s["advanced"]
     w = 58
     print("\n" + "=" * w)
@@ -153,6 +162,11 @@ def _print_summary(s: dict) -> None:
 
 
 def _plot(s: dict, out_dir: str) -> None:
+    """Save a grouped-bar comparison figure for the common-subset RAGAS metrics.
+
+    :param s: summary dict as built by :func:`main`
+    :param out_dir: directory to write ``{dataset}_ragas_common.pdf/png`` into
+    """
     try:
         import matplotlib.pyplot as plt
         import matplotlib.ticker as mticker

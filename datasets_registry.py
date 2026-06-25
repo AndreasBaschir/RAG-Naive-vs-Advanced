@@ -32,10 +32,9 @@ class DatasetSpec:
     key: str
     collection_name: str
     bm25_cache_dir: pathlib.Path
-    load_corpus: Callable[[], list[dict]]       # -> [{"text", "title"}] for ingestion
-    load_eval_rows: Callable[[], list[dict]]    # raw rows for benchmark sampling
-    make_record: Callable[[dict], dict | None]  # row -> benchmark record (None to skip)
-    # Optional: row -> unanswerable record for the hallucination/abstention test.
+    load_corpus: Callable[[], list[dict]]
+    load_eval_rows: Callable[[], list[dict]]
+    make_record: Callable[[dict], dict | None]
     make_negative_record: Callable[[dict], dict | None] | None = None
 
 
@@ -44,35 +43,43 @@ _active: str = os.environ.get("RAG_DATASET", "squad")
 
 
 def register(spec: DatasetSpec) -> None:
+    """Add *spec* to the dataset registry under its key.
+
+    :param spec: fully-configured dataset specification
+    """
     _REGISTRY[spec.key] = spec
 
 
 def available() -> list[str]:
+    """Return a sorted list of all registered dataset keys."""
     return sorted(_REGISTRY)
 
 
 def set_active(key: str) -> None:
+    """Set the process-global active dataset and propagate to ``RAG_DATASET``.
+
+    :param key: registered dataset key
+    :raises ValueError: if *key* is not in the registry
+    """
     global _active
     if key not in _REGISTRY:
         raise ValueError(f"unknown dataset {key!r}; have {available()}")
     _active = key
-    os.environ["RAG_DATASET"] = key  # propagate to any re-import / child process
+    os.environ["RAG_DATASET"] = key
 
 
 def active() -> DatasetSpec:
+    """Return the :class:`DatasetSpec` for the currently active dataset."""
     return _REGISTRY[_active]
 
 
 def active_key() -> str:
+    """Return the key string of the currently active dataset."""
     return _active
 
 
-# --------------------------------------------------------------------------- #
-# SQuAD                                                                        #
-# --------------------------------------------------------------------------- #
-
 def _squad_corpus() -> list[dict]:
-    """Unique SQuAD contexts as [{"text", "title"}] (one paragraph per entry)."""
+    """Return unique SQuAD contexts as ``[{"text", "title"}]`` (one paragraph per entry)."""
     from datasets import load_dataset
 
     dataset = load_dataset("rajpurkar/squad", split="train")
@@ -88,12 +95,18 @@ def _squad_corpus() -> list[dict]:
 
 
 def _squad_eval_rows() -> list[dict]:
+    """Return all SQuAD training rows for benchmark sampling."""
     from datasets import load_dataset
 
     return list(load_dataset("rajpurkar/squad", split="train"))
 
 
 def _squad_record(row: dict) -> dict:
+    """Build a benchmark record from a raw SQuAD row.
+
+    :param row: raw HuggingFace SQuAD row dict
+    :returns: record with ``question``, ``gold_context``, ``gold_answers``, ``gold_title``
+    """
     return {
         "question": row["question"],
         "gold_context": row["context"],
@@ -102,25 +115,32 @@ def _squad_record(row: dict) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
-# DocRED (relation extraction)                                                 #
-# --------------------------------------------------------------------------- #
-
 _DOCRED_REPO = "thunlp/docred"
 _DOCRED_SPLIT = "train_annotated"
 _docred_rows_cache: list[dict] | None = None
 
 
 def _docred_doc_text(row: dict) -> str:
+    """Flatten a DocRED document's sentence list into a single space-joined string.
+
+    :param row: normalised DocRED row with a ``sents`` field
+    :returns: full document text
+    """
     return " ".join(" ".join(sent) for sent in row["sents"])
 
 
 def _normalize_labels(labels: Any, rel_info: dict | None = None) -> list[dict]:
-    """Normalize DocRED labels (either dict-of-lists or list-of-dicts) to a
-    canonical list of {head, tail, relation_id, relation_text, evidence}."""
+    """Normalise DocRED labels to a canonical list of relation dicts.
+
+    Handles both the Parquet form (dict of parallel lists) and the raw JSON
+    form (list of ``{h, t, r, evidence}`` dicts).
+
+    :param labels: raw labels field from a DocRED row
+    :param rel_info: optional ``{relation_id: relation_text}`` lookup for the JSON form
+    :returns: list of ``{head, tail, relation_id, relation_text, evidence}`` dicts
+    """
     out: list[dict] = []
 
-    # Parquet / load_dataset form: dict of parallel lists (numpy arrays).
     if isinstance(labels, dict):
         n = len(labels.get("head", []))
         ev = labels.get("evidence", None)
@@ -135,7 +155,6 @@ def _normalize_labels(labels: Any, rel_info: dict | None = None) -> list[dict]:
             })
         return out
 
-    # Raw JSON form: list of {h, t, r, evidence} with no relation_text.
     for lab in labels:
         rid = lab.get("relation_id", lab.get("r", ""))
         rtext = lab.get("relation_text") or (rel_info or {}).get(rid, rid)
@@ -150,6 +169,12 @@ def _normalize_labels(labels: Any, rel_info: dict | None = None) -> list[dict]:
 
 
 def _normalize_row(row: dict, rel_info: dict | None = None) -> dict:
+    """Return a normalised DocRED row with :func:`_normalize_labels` applied.
+
+    :param row: raw DocRED row
+    :param rel_info: forwarded to :func:`_normalize_labels` for the JSON form
+    :returns: dict with ``title``, ``sents``, ``vertexSet``, ``labels``
+    """
     return {
         "title": row["title"],
         "sents": row["sents"],
@@ -159,15 +184,20 @@ def _normalize_row(row: dict, rel_info: dict | None = None) -> dict:
 
 
 def _load_docred() -> list[dict]:
-    """Load DocRED train_annotated as normalized rows, trying several
-    strategies because datasets>=4 dropped script-based loading."""
+    """Load DocRED ``train_annotated`` as normalised rows, with in-process caching.
+
+    Tries three strategies in order: ``load_dataset`` auto-parquet, direct parquet
+    from the ``refs/convert/parquet`` branch, then raw JSON download.
+
+    :returns: list of normalised DocRED row dicts
+    :raises RuntimeError: if all three loading strategies fail
+    """
     global _docred_rows_cache
     if _docred_rows_cache is not None:
         return _docred_rows_cache
 
     rows: list[dict] | None = None
 
-    # 1) Auto-parquet export via load_dataset.
     try:
         from datasets import load_dataset
 
@@ -177,7 +207,6 @@ def _load_docred() -> list[dict]:
     except Exception as exc:  # noqa: BLE001
         print(f"[docred] load_dataset failed ({exc}); trying direct parquet...")
 
-    # 2) Direct parquet on the refs/convert/parquet branch.
     if rows is None:
         try:
             import pandas as pd
@@ -200,7 +229,6 @@ def _load_docred() -> list[dict]:
         except Exception as exc:  # noqa: BLE001
             print(f"[docred] direct parquet failed ({exc}); trying raw JSON...")
 
-    # 3) Raw JSON + rel_info.json from the repo.
     if rows is None:
         try:
             from huggingface_hub import hf_hub_download
@@ -231,7 +259,7 @@ def _load_docred() -> list[dict]:
 
 
 def _docred_corpus() -> list[dict]:
-    """One entry per DocRED document, de-duped by title."""
+    """Return one ``{"text", "title"}`` entry per DocRED document, de-duped by title."""
     seen: set[str] = set()
     corpus: list[dict] = []
     for row in _load_docred():
@@ -244,11 +272,16 @@ def _docred_corpus() -> list[dict]:
 
 
 def _docred_eval_rows() -> list[dict]:
+    """Return all normalised DocRED training rows for benchmark sampling."""
     return _load_docred()
 
 
 def _entity_names(entity: list[dict]) -> list[str]:
-    """De-duplicated (case-insensitive) surface forms of an entity's mentions."""
+    """Return de-duplicated (case-insensitive) surface forms of an entity's mentions.
+
+    :param entity: list of mention dicts, each with a ``name`` field
+    :returns: unique names in first-occurrence order
+    """
     names: list[str] = []
     seen: set[str] = set()
     for mention in entity:
@@ -260,14 +293,19 @@ def _entity_names(entity: list[dict]) -> list[str]:
 
 
 def _docred_record(row: dict) -> dict | None:
-    """Pick one relation triple deterministically and build a QA-style record."""
+    """Build a QA-style benchmark record from a DocRED row.
+
+    Selects one relation triple deterministically: triples with evidence are
+    preferred; ties broken on ``(relation_id, head, tail)``; self-loops excluded.
+
+    :param row: normalised DocRED row
+    :returns: record dict, or ``None`` if no usable triple exists
+    """
     labels = row["labels"]
     vertex = row["vertexSet"]
     if not labels or len(vertex) == 0:
         return None
 
-    # Prefer triples with evidence; tie-break stable on (relation_id, head, tail);
-    # skip self-loops.
     candidates = [
         lab for lab in labels
         if lab["head"] != lab["tail"]
@@ -292,7 +330,6 @@ def _docred_record(row: dict) -> dict | None:
         "gold_context": _docred_doc_text(row),
         "gold_answers": tail_names,
         "gold_title": row["title"],
-        # relation-extraction metadata for post-hoc breakdowns
         "answerable": True,
         "relation": relation,
         "relation_id": lab["relation_id"],
@@ -305,7 +342,7 @@ _docred_relations_cache: list[str] | None = None
 
 
 def _docred_relations() -> list[str]:
-    """Sorted vocabulary of all relation_text values across DocRED."""
+    """Return a sorted vocabulary of all ``relation_text`` values across DocRED."""
     global _docred_relations_cache
     if _docred_relations_cache is None:
         vocab: set[str] = set()
@@ -318,12 +355,17 @@ def _docred_relations() -> list[str]:
 
 
 def _docred_negative_record(row: dict) -> dict | None:
-    """Build an UNANSWERABLE question: a real head entity paired with a relation
-    it does NOT have in this document. Correct behaviour is to abstain, so these
-    measure each pipeline's hallucination resistance.
+    """Build an unanswerable question for hallucination-resistance evaluation.
 
-    Caveat: DocRED annotations are not exhaustive, so a 'negative' relation may
-    occasionally hold in reality (a known DocRED limitation) — treated as noise.
+    Pairs a real head entity with a relation it does NOT hold in this document.
+    Correct pipeline behaviour is to abstain.
+
+    .. note::
+        DocRED annotations are not exhaustive, so a "negative" relation may
+        occasionally hold in reality — treated as noise.
+
+    :param row: normalised DocRED row
+    :returns: unanswerable record dict, or ``None`` if no valid head entity found
     """
     labels = row["labels"]
     vertex = row["vertexSet"]
@@ -346,13 +388,12 @@ def _docred_negative_record(row: dict) -> dict | None:
         return None
     head_name = head_names[0]
 
-    # Relations this head actually has in the document — exclude them.
     held = {l["relation_text"] for l in labels if l["head"] == lab["head"]}
     vocab = [r for r in _docred_relations() if r not in held]
     if not vocab:
         return None
 
-    # Stable, reproducible pick (independent of PYTHONHASHSEED).
+    # CRC32 gives a stable, PYTHONHASHSEED-independent index into vocab.
     neg_relation = vocab[zlib.crc32(f"{row['title']}|{head_name}".encode()) % len(vocab)]
     return {
         "question": f'What is the "{neg_relation}" of {head_name}?',
@@ -363,10 +404,6 @@ def _docred_negative_record(row: dict) -> dict | None:
         "relation": neg_relation,
     }
 
-
-# --------------------------------------------------------------------------- #
-# Registration                                                                 #
-# --------------------------------------------------------------------------- #
 
 register(DatasetSpec(
     key="squad",

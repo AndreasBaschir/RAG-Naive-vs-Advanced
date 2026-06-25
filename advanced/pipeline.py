@@ -20,13 +20,13 @@ import ollama
 from advanced.retrieval import bm25_retrieve, dense_retrieve_vec, encode, rerank, rrf_merge
 
 LLM_MODEL = "qwen3:8b"
-EXPANSION_MODEL = "qwen3:1.7b"  # small/fast model just for query rephrasing
+EXPANSION_MODEL = "qwen3:1.7b"
 
-N_DENSE = 20    # dense candidates per query variant
-N_BM25 = 20    # BM25 candidates per query variant
-N_VARIANTS = 2  # extra query reformulations to generate
-RERANK_POOL = 40  # max candidates fed into the cross-encoder
-FINAL_K = 5    # chunks passed to the LLM
+N_DENSE = 20
+N_BM25 = 20
+N_VARIANTS = 2
+RERANK_POOL = 40
+FINAL_K = 5
 
 _EXPAND_PROMPT = """\
 Generate {n} alternative phrasings for the following search query. \
@@ -47,21 +47,23 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 def retrieve(query: str) -> list[dict]:
-    """
-    Return FINAL_K reranked chunks for the query.
+    """Return ``FINAL_K`` reranked chunks for *query*.
 
-    Steps:
-      1. Generate N_VARIANTS alternative query phrasings via the LLM.
-      2. Run dense + BM25 retrieval for every query variant.
-      3. Merge all ranked lists with Reciprocal Rank Fusion.
-      4. Rerank the top-RERANK_POOL candidates with a cross-encoder.
+    Pipeline stages:
+
+    1. Generate ``N_VARIANTS`` alternative query phrasings via the LLM.
+    2. Batch-encode all variants in a single forward pass.
+    3. Fan out dense + BM25 retrievals in parallel across all query variants.
+    4. Merge ranked lists with Reciprocal Rank Fusion.
+    5. Rerank the top-``RERANK_POOL`` candidates with a cross-encoder.
+
+    :param query: user question
+    :returns: up to ``FINAL_K`` chunks, each dict containing at least
+              ``text``, ``source``, and ``score``
     """
     queries = _expand_queries(query)
-
-    # Batch-encode all query variants in a single forward pass.
     vecs = encode(queries)
 
-    # Fan out dense + BM25 retrievals in parallel across all query variants.
     with ThreadPoolExecutor(max_workers=len(queries) * 2) as ex:
         dense_futs = [ex.submit(dense_retrieve_vec, vec, N_DENSE) for vec in vecs]
         bm25_futs = [ex.submit(bm25_retrieve, q, N_BM25) for q in queries]
@@ -78,6 +80,12 @@ def retrieve(query: str) -> list[dict]:
 
 
 def stream(query: str, chunks: list[dict]) -> Generator[str, None, None]:
+    """Yield LLM response tokens grounded in *chunks*.
+
+    :param query: original user question
+    :param chunks: context chunks retrieved by :func:`retrieve`
+    :returns: generator of streamed token strings
+    """
     context = "\n\n".join(c["text"] for c in chunks)
 
     for part in ollama.chat(
@@ -92,7 +100,11 @@ def stream(query: str, chunks: list[dict]) -> Generator[str, None, None]:
 
 
 def _expand_queries(query: str) -> list[str]:
-    """Ask the LLM for N_VARIANTS alternative phrasings; fall back gracefully."""
+    """Ask the LLM for ``N_VARIANTS`` alternative phrasings; return only the original on failure.
+
+    :param query: original user query
+    :returns: list starting with *query*, followed by up to ``N_VARIANTS`` alternatives
+    """
     try:
         resp = ollama.chat(
             model=EXPANSION_MODEL,

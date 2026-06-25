@@ -16,15 +16,11 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from datasets_registry import CHROMA_PATH, active, active_key
 
-# Guards the lazy singletons below. advanced/pipeline.py builds dense + BM25
-# results across several query variants in parallel threads, so the first
-# (cache-miss) build must not be entered by more than one thread at once.
+# Serialises singleton first-init: pipeline.py fans out threads per query, so concurrent cache-misses must be blocked.
 _init_lock = threading.RLock()
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-# Force with RAG_DEVICE=cpu (e.g. to leave the GPU entirely to Ollama);
-# otherwise auto-detect CUDA.
 DEVICE = os.environ.get("RAG_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 
 _embedder: SentenceTransformer | None = None
@@ -37,17 +33,31 @@ _bm25_key: str | None = None
 
 
 def encode(texts: list[str]) -> list[list[float]]:
-    """Batch-encode a list of texts into embedding vectors."""
+    """Batch-encode a list of texts into embedding vectors.
+
+    :param texts: strings to embed
+    :returns: list of float vectors, one per input text
+    """
     return _get_embedder().encode(texts, batch_size=len(texts)).tolist()
 
 
 def dense_retrieve(query: str, n: int = 20) -> list[dict]:
-    """Top-n chunks via dense cosine similarity in ChromaDB."""
+    """Return the top-*n* chunks via dense cosine similarity in ChromaDB.
+
+    :param query: search query (encoded internally)
+    :param n: maximum number of results
+    :returns: ranked chunk dicts with ``text``, ``source``, ``dense_score``
+    """
     return dense_retrieve_vec(_get_embedder().encode(query).tolist(), n)
 
 
 def dense_retrieve_vec(vec: list[float], n: int = 20) -> list[dict]:
-    """Top-n chunks using a pre-computed embedding vector (skips encoding)."""
+    """Return the top-*n* chunks using a pre-computed embedding vector.
+
+    :param vec: pre-computed query embedding (skips the encoding step)
+    :param n: maximum number of results
+    :returns: ranked chunk dicts with ``text``, ``source``, ``dense_score``
+    """
     col = _get_collection()
     if col.count() == 0:
         return []
@@ -73,7 +83,12 @@ def dense_retrieve_vec(vec: list[float], n: int = 20) -> list[dict]:
 
 
 def bm25_retrieve(query: str, n: int = 20) -> list[dict]:
-    """Top-n chunks via BM25 keyword scoring over the full corpus."""
+    """Return the top-*n* chunks via BM25 keyword scoring over the full corpus.
+
+    :param query: search query (tokenised internally)
+    :param n: maximum number of results
+    :returns: ranked chunk dicts with ``text``, ``source``, ``bm25_score``
+    """
     index, corpus = _get_bm25()
     query_tokens = bm25s.tokenize([query])
     results, scores = index.retrieve(query_tokens, k=min(n, len(corpus)))
@@ -90,11 +105,14 @@ def bm25_retrieve(query: str, n: int = 20) -> list[dict]:
 
 
 def rrf_merge(ranked_lists: list[list[dict]], k: int = 60) -> list[dict]:
-    """
-    Reciprocal Rank Fusion across multiple ranked result lists.
+    """Merge multiple ranked result lists with Reciprocal Rank Fusion.
 
-    Score formula: sum(1 / (k + rank)) across all lists a document appears in.
+    Score formula: ``sum(1 / (k + rank))`` across all lists a document appears in.
     Deduplication is by text content.
+
+    :param ranked_lists: list of ranked chunk lists (dense or BM25 results)
+    :param k: RRF smoothing constant
+    :returns: merged and re-sorted list with ``rrf_score`` added to each chunk
     """
     scores: dict[str, float] = {}
     doc_map: dict[str, dict] = {}
@@ -113,9 +131,15 @@ def rrf_merge(ranked_lists: list[list[dict]], k: int = 60) -> list[dict]:
 
 
 def rerank(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
-    """
-    Cross-encoder reranking: scores each (query, passage) pair independently,
+    """Re-score *candidates* with a cross-encoder and return the top-*top_k*.
+
+    Cross-encoder reranking scores each (query, passage) pair independently,
     providing more accurate relevance than bi-encoder similarity alone.
+
+    :param query: original user query
+    :param candidates: pool of chunks to rerank (each must have a ``text`` key)
+    :param top_k: number of top-scoring chunks to return
+    :returns: top-*top_k* chunks sorted by ``rerank_score`` descending
     """
     if not candidates:
         return []
@@ -131,9 +155,8 @@ def rerank(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
     return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)[:top_k]
 
 
-# --- Lazy singletons ---
-
 def _get_embedder() -> SentenceTransformer:
+    """Return the bi-encoder singleton, initialising on first call (thread-safe)."""
     global _embedder
     if _embedder is not None:
         return _embedder
@@ -144,13 +167,17 @@ def _get_embedder() -> SentenceTransformer:
 
 
 def _get_collection() -> chromadb.Collection:
+    """Return the ChromaDB collection for the active dataset, re-opening on switch.
+
+    Also invalidates the BM25 cache when the active dataset changes so the
+    two caches stay in sync.
+    """
     global _collection, _collection_key, _bm25_index, _bm25_corpus
     if _collection is not None and _collection_key == active_key():
         return _collection
     with _init_lock:
         if _collection is not None and _collection_key == active_key():
             return _collection
-        # Dataset switched (or first call): drop any stale BM25 state too.
         _bm25_index = None
         _bm25_corpus = None
         CHROMA_PATH.mkdir(parents=True, exist_ok=True)
@@ -164,6 +191,7 @@ def _get_collection() -> chromadb.Collection:
 
 
 def _get_reranker() -> CrossEncoder:
+    """Return the cross-encoder singleton, initialising on first call (thread-safe)."""
     global _reranker
     if _reranker is not None:
         return _reranker
@@ -174,6 +202,15 @@ def _get_reranker() -> CrossEncoder:
 
 
 def _get_bm25() -> tuple[bm25s.BM25, list[dict]]:
+    """Return the BM25 index and corpus for the active dataset (thread-safe).
+
+    Loads from disk cache if available; otherwise builds from the ChromaDB
+    collection and persists the result. Uses bm25s native save/load rather
+    than pickle to avoid cross-version score-index corruption.
+
+    :returns: ``(BM25 index, corpus)`` where corpus is a list of
+              ``{"text", "title"}`` dicts
+    """
     global _bm25_index, _bm25_corpus, _bm25_key
     if _bm25_index is not None and _bm25_corpus is not None and _bm25_key == active_key():
         return _bm25_index, _bm25_corpus
@@ -181,13 +218,9 @@ def _get_bm25() -> tuple[bm25s.BM25, list[dict]]:
     import json
 
     with _init_lock:
-        # Re-check inside the lock: another thread may have built it already.
         if _bm25_index is not None and _bm25_corpus is not None and _bm25_key == active_key():
             return _bm25_index, _bm25_corpus
 
-        # Use bm25s' native save/load (NOT pickle) — pickled BM25 objects lose
-        # the `scores` index across library versions/machines. The doc corpus
-        # (text + title) is stored alongside as JSON.
         cache_dir = active().bm25_cache_dir
         corpus_file = cache_dir / "corpus.json"
 
@@ -215,8 +248,7 @@ def _get_bm25() -> tuple[bm25s.BM25, list[dict]]:
         with open(corpus_file, "w") as f:
             json.dump(corpus, f)
 
-        # Publish to the globals only once fully built, so no other thread can
-        # observe a half-initialised index.
+        # Publish to globals only once fully built to prevent half-initialised reads.
         _bm25_corpus = corpus
         _bm25_index = index
         _bm25_key = active_key()

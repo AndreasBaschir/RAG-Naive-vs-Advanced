@@ -1,8 +1,9 @@
+#!/usr/bin/env python3
 """
 Ingest a dataset's corpus into ChromaDB.
 
-Ambele pipeline-uri (naive și advanced) citesc din aceeași colecție per dataset.
-Diferența dintre ele stă în arhitectura de retrieval, nu în date.
+Both pipeline variants (naive and advanced) read from the same per-dataset
+collection; the difference lies in retrieval architecture, not in data.
 
 Run once per dataset:
     python ingest.py                  # squad (default)
@@ -23,6 +24,13 @@ BATCH_SIZE = 256
 
 
 def ingest(dataset: str) -> None:
+    """Embed and store the full corpus of *dataset* into ChromaDB.
+
+    Skips ingestion if the target collection already contains documents.
+    Embeddings are computed in batches of ``BATCH_SIZE`` to bound memory usage.
+
+    :param dataset: registered dataset key (e.g. ``"squad"``, ``"docred"``)
+    """
     set_active(dataset)
     spec = active()
 

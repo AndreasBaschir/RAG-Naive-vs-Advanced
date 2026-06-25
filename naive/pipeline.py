@@ -13,8 +13,6 @@ from datasets_registry import CHROMA_PATH, active, active_key
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TOP_K = 5
 LLM_MODEL = "qwen3:8b"
-# Force with RAG_DEVICE=cpu (e.g. to leave the GPU entirely to Ollama);
-# otherwise auto-detect CUDA.
 DEVICE = os.environ.get("RAG_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 
 _SYSTEM_PROMPT = (
@@ -30,14 +28,17 @@ _collection_key: str | None = None
 
 
 def retrieve(query: str) -> list[dict]:
-    """
-    Embed the query with all-MiniLM-L6-v2 and return the top-K chunks
+    """Embed *query* with all-MiniLM-L6-v2 and return the top-K chunks
     from ChromaDB by cosine similarity.
 
-    Each dict has:
-        "text":   str   — chunk content
-        "source": str   — SQuAD article title
-        "score":  float — cosine similarity (0-1)
+    Each returned dict contains:
+
+    - ``text``: chunk content
+    - ``source``: SQuAD article title
+    - ``score``: cosine similarity in [0, 1]
+
+    :param query: user question to embed and search
+    :returns: up to ``TOP_K`` ranked chunks; empty list if the collection is empty
     """
     col = _get_collection()
     if col.count() == 0:
@@ -67,6 +68,12 @@ def retrieve(query: str) -> list[dict]:
 
 
 def stream(query: str, chunks: list[dict]) -> Generator[str, None, None]:
+    """Yield LLM response tokens grounded in *chunks*.
+
+    :param query: original user question
+    :param chunks: context chunks retrieved by :func:`retrieve`
+    :returns: generator of streamed token strings
+    """
     context = "\n\n".join(c["text"] for c in chunks)
 
     for part in ollama.chat(
@@ -79,7 +86,9 @@ def stream(query: str, chunks: list[dict]) -> Generator[str, None, None]:
     ):
         yield part["message"]["content"]
 
+
 def _get_embedder() -> SentenceTransformer:
+    """Return the module-level embedder singleton, initialising on first call."""
     global _embedder
     if _embedder is None:
         _embedder = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE)
@@ -87,6 +96,7 @@ def _get_embedder() -> SentenceTransformer:
 
 
 def _get_collection() -> chromadb.Collection:
+    """Return the ChromaDB collection for the active dataset, re-opening on dataset switch."""
     global _collection, _collection_key
     if _collection is not None and _collection_key == active_key():
         return _collection
