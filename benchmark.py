@@ -230,9 +230,6 @@ def _ragas_from_file(args) -> None:
     Retrieved chunk texts are not stored in the JSON, so RAGAS faithfulness
     is scored against the gold context. Unanswerable (negative) records are
     excluded — they have no gold answer to be faithful to.
-
-    :param args: parsed CLI namespace (uses ``args.ragas_from``, ``args.output``,
-                 ``args.ragas_workers``, ``args.plot``, ``args.figures_dir``)
     """
     with open(args.ragas_from) as fh:
         data = json.load(fh)
@@ -308,13 +305,7 @@ def _ragas_from_file(args) -> None:
 
 def _write_checkpoint(path: str, per_seed_summaries: list[dict],
                       all_records: list[dict], seeds: list[int]) -> None:
-    """Write a partial-results checkpoint so a mid-run crash loses at most one seed.
-
-    :param path: destination file path
-    :param per_seed_summaries: summaries for seeds completed so far
-    :param all_records: all per-question records accumulated so far
-    :param seeds: full seed list for the run
-    """
+    """Write a partial-results checkpoint so a mid-run crash loses at most one seed."""
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         json.dump({
@@ -332,9 +323,6 @@ def _aggregate_summaries(summaries: list[dict]) -> dict:
     Only metrics present in *every* seed are aggregated, so a RAGAS failure on
     one seed neither crashes the run nor silently corrupts the output table.
     Single-seed runs return the summary unchanged (no std column).
-
-    :param summaries: list of per-seed summary dicts (one per seed)
-    :returns: aggregated summary dict with ``{key}`` and ``{key}_std`` entries
     """
     if len(summaries) == 1:
         return summaries[0]
@@ -369,12 +357,6 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b",
 
     ``num_ctx=4096`` is intentional: RAGAS prompts are well under 4 K tokens,
     so the model's 40 K default wastes KV-cache and reduces parallelism.
-
-    :param rows_by_pipeline: ``{"naive": [...], "advanced": [...]}`` where each
-                             entry has ``question``, ``answer``, ``contexts``
-    :param llm_model: Ollama model name used as RAGAS judge
-    :param ragas_workers: max concurrent judge calls (match ``OLLAMA_NUM_PARALLEL``)
-    :returns: ``{"naive": {"faithfulness": float, "answer_relevancy": float}, ...}``
     """
     try:
         from ragas import EvaluationDataset, SingleTurnSample, evaluate
@@ -440,16 +422,7 @@ def _run_ragas(rows_by_pipeline: dict, llm_model: str = "qwen3:8b",
 def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
                   out_dir: str, multi_seed: bool, num_seeds: int = DEFAULT_NUM_SEEDS,
                   dataset: str = "squad") -> None:
-    """Generate and save thesis-ready figures (PDF + PNG) from *summary*.
-
-    :param summary: aggregated benchmark summary dict
-    :param with_generation: whether answer-quality metrics are present
-    :param with_ragas: whether RAGAS metrics are present
-    :param out_dir: directory to write figure files into
-    :param multi_seed: whether to render error bars
-    :param num_seeds: seed count, shown in axis labels when *multi_seed*
-    :param dataset: dataset key used to prefix output filenames and axis titles
-    """
+    """Generate and save thesis-ready figures (PDF + PNG) from *summary*."""
     try:
         import matplotlib.pyplot as plt
         import matplotlib.ticker as mticker
@@ -483,20 +456,9 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
     ds_label = dataset.upper()
 
     def _get(d: dict, key: str) -> tuple[float, float]:
-        """Return ``(mean, std)`` for *key*; std is 0.0 when not multi-seed.
-
-        :param d: pipeline summary sub-dict
-        :param key: metric name
-        :returns: (mean, std) pair
-        """
         return d[key], d.get(f"{key}_std", 0.0)
 
     def _save(fig: "plt.Figure", name: str) -> None:
-        """Save *fig* as ``{dataset}_{name}.pdf`` and ``.png`` in *out_dir*.
-
-        :param fig: matplotlib figure to save
-        :param name: base filename suffix (without extension)
-        """
         fname = f"{dataset}_{name}"
         for ext in ("pdf", "png"):
             fig.savefig(os.path.join(out_dir, f"{fname}.{ext}"), dpi=300, bbox_inches="tight")
@@ -505,15 +467,6 @@ def _plot_results(summary: dict, with_generation: bool, with_ragas: bool,
 
     def _grouped_bars(ax, labels, naive_vals, adv_vals,
                       naive_errs=None, adv_errs=None) -> None:
-        """Draw side-by-side bars for Naive RAG and Advanced RAG on *ax*.
-
-        :param ax: matplotlib axes to draw on
-        :param labels: x-axis tick labels
-        :param naive_vals: bar heights for Naive RAG
-        :param adv_vals: bar heights for Advanced RAG
-        :param naive_errs: optional error bar sizes for Naive RAG
-        :param adv_errs: optional error bar sizes for Advanced RAG
-        """
         x   = np.arange(len(labels))
         w   = 0.35
         kw  = {"capsize": 5, "error_kw": {"elinewidth": 1.2}} if multi_seed else {}
@@ -672,11 +625,6 @@ def _context_rank(chunks: list[dict], gold_answers: list[str],
     When *gold_title* is given, a chunk only counts if it also comes from the
     correct article. This prevents short answer spans (e.g. "May", "US") from
     spuriously matching unrelated passages and inflating recall.
-
-    :param chunks: ranked list of retrieved chunk dicts
-    :param gold_answers: list of acceptable answer strings
-    :param gold_title: source title the matching chunk must come from (optional)
-    :returns: 1-based rank, or ``None`` if no chunk matched
     """
     golds = [a.lower() for a in gold_answers]
     title = gold_title.strip().lower() if gold_title else None
@@ -690,22 +638,13 @@ def _context_rank(chunks: list[dict], gold_answers: list[str],
 
 
 def _normalize(text: str) -> str:
-    """Lowercase *text*, strip punctuation, and collapse whitespace.
-
-    :param text: raw text string
-    :returns: normalised token string
-    """
+    """Lowercase, strip punctuation, and collapse whitespace."""
     text = text.lower().translate(str.maketrans("", "", string.punctuation))
     return " ".join(text.split())
 
 
 def _token_f1(prediction: str, reference: str) -> float:
-    """Compute SQuAD-style token-F1 between *prediction* and *reference*.
-
-    :param prediction: generated answer text
-    :param reference: gold reference answer text
-    :returns: F1 score in [0, 1]
-    """
+    """Compute SQuAD-style token-F1 between prediction and reference."""
     pred_tokens = _normalize(prediction).split()
     ref_tokens  = _normalize(reference).split()
     common      = Counter(pred_tokens) & Counter(ref_tokens)
@@ -718,43 +657,25 @@ def _token_f1(prediction: str, reference: str) -> float:
 
 
 def _exact_match(prediction: str, reference: str) -> bool:
-    """Return ``True`` if the normalised *reference* is a substring of normalised *prediction*.
-
-    :param prediction: generated answer text
-    :param reference: gold reference answer text
-    :returns: whether the prediction contains the reference after normalisation
-    """
+    """Return True if the normalised reference is a substring of normalised prediction."""
     return _normalize(reference) in _normalize(prediction)
 
 
 def _avg(values: list) -> float:
-    """Return the arithmetic mean of *values*, or 0.0 for an empty list.
-
-    :param values: list of numeric values
-    :returns: mean value
-    """
+    """Return the arithmetic mean, or 0.0 for an empty list."""
     return sum(values) / len(values) if values else 0.0
 
 
 def _sample_std(values: list) -> float:
-    """Return sample standard deviation (ddof=1), or 0.0 for fewer than 2 values.
-
-    :param values: list of numeric values
-    :returns: sample standard deviation
-    """
+    """Return sample standard deviation (ddof=1), or 0.0 for fewer than 2 values."""
     return statistics.stdev(values) if len(values) > 1 else 0.0
 
 
 def _build_summary(records: list[dict], with_generation: bool, ragas_scores: dict) -> dict:
-    """Build a per-seed metric summary from evaluated *records*.
+    """Build a per-seed metric summary from evaluated records.
 
     Retrieval and answer-quality metrics are computed over answerable questions
     only; the hallucination metric is computed over the unanswerable ones.
-
-    :param records: list of per-question result dicts (both pipelines in each)
-    :param with_generation: whether answer-quality fields are present in records
-    :param ragas_scores: RAGAS scores dict returned by :func:`_run_ragas`, or ``{}``
-    :returns: summary dict keyed by ``"naive"`` and ``"advanced"``
     """
     answerable = [r for r in records if r.get("answerable", True)]
     negatives = [r for r in records if not r.get("answerable", True)]
@@ -785,13 +706,7 @@ def _build_summary(records: list[dict], with_generation: bool, ragas_scores: dic
 
 
 def _fmt(summary: dict, key: str, multi_seed: bool) -> str:
-    """Format a metric value as ``"mean"`` or ``"mean ± std"`` for display.
-
-    :param summary: pipeline summary sub-dict
-    :param key: metric name
-    :param multi_seed: whether to append the std column
-    :returns: formatted string
-    """
+    """Format a metric value as "mean" or "mean ± std" for display."""
     mean = summary[key]
     std  = summary.get(f"{key}_std")
     if multi_seed and std is not None:
@@ -801,14 +716,7 @@ def _fmt(summary: dict, key: str, multi_seed: bool) -> str:
 
 def _print_results(summary: dict, with_generation: bool, with_ragas: bool,
                    multi_seed: bool, num_seeds: int = DEFAULT_NUM_SEEDS) -> None:
-    """Print the benchmark results table to stdout.
-
-    :param summary: aggregated summary dict
-    :param with_generation: whether to include answer-quality rows
-    :param with_ragas: whether to include RAGAS metric rows
-    :param multi_seed: whether to show ± std columns
-    :param num_seeds: seed count for the header annotation
-    """
+    """Print the benchmark results table to stdout."""
     n = summary["naive"]
     a = summary["advanced"]
     col_w = 18 if multi_seed else 14
@@ -824,11 +732,6 @@ def _print_results(summary: dict, with_generation: bool, with_ragas: bool,
     print("-" * w)
 
     def row(label: str, key: str) -> None:
-        """Print a single metric row.
-
-        :param label: display name for the metric
-        :param key: key in the summary dict
-        """
         nv = _fmt(n, key, multi_seed)
         av = _fmt(a, key, multi_seed)
         print(f"{label:<30} {nv:>{col_w}} {av:>{col_w}}")
@@ -861,10 +764,6 @@ def _significance_tests(records: list[dict], with_generation: bool) -> dict:
     Binary metrics (recall, exact_match) use McNemar's test (exact binomial).
     All tests run over answerable questions only; the hallucination abstention
     test runs over the unanswerable subset.
-
-    :param records: all per-question result dicts across all seeds
-    :param with_generation: whether answer-quality metrics are present
-    :returns: ``{}`` if scipy is unavailable; otherwise a dict of test results
     """
     try:
         from scipy.stats import binomtest, wilcoxon
@@ -920,10 +819,7 @@ def _significance_tests(records: list[dict], with_generation: bool) -> dict:
 
 
 def _print_significance(tests: dict) -> None:
-    """Print the significance test results table to stdout.
-
-    :param tests: dict returned by :func:`_significance_tests`
-    """
+    """Print the significance test results table to stdout."""
     if not tests:
         return
     print("\nPaired significance tests (Advanced vs Naive, pooled questions):")
@@ -938,16 +834,11 @@ def _print_significance(tests: dict) -> None:
 
 
 def _print_progress(current: int, total: int) -> None:
-    """Print or update an ASCII progress bar on stdout.
-
-    :param current: number of items processed so far
-    :param total: total number of items
-    """
+    """Print or update an ASCII progress bar on stdout."""
     pct    = current / total
     bar_len = 38
     filled  = int(bar_len * pct)
     bar     = "█" * filled + "░" * (bar_len - filled)
-    import sys
     if sys.stdout.isatty():
         print(f"\r  [{bar}] {current}/{total}", end="", flush=True)
     elif current == total:
