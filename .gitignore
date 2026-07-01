@@ -8,3 +8,4 @@ data/
 
 # Streamlit config (local overrides)
 .streamlit/
+run_overnight.sh
